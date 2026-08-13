@@ -1,0 +1,399 @@
+# Creates a Vivado project with a Zynq PS7 block design wired for the comms
+# DSP PL datapath, and pulls in the HDL sources from dsp-cake/comms_dsp.
+#
+#   PS DDR --(AXI DMA MM2S)--> PL dsp_top --(AXI DMA S2MM)--> PS DDR
+#   PS GP0 --(AXI4-Lite)--> PL reg_rw_interface (user register space)
+#   PS GP1 --> axi_dma_0 control/status
+#   DMA mm2s/s2mm interrupts -> PS fabric interrupt (for dma_proxy)
+#
+# system_top.vhd (in dsp-cake/comms_dsp/hdl) is the design top; the block
+# design wrapper is instantiated inside it.
+#
+# Usage (batch mode, no GUI):
+#   vivado -mode batch -source create_project.tcl -tclargs BOARD_PART PART PROJECT_NAME PROJECT_DIR
+#
+# Example, Zybo Z7-20 (identifier verified against Digilent/vivado-boards):
+#   vivado -mode batch -source create_project.tcl -tclargs digilentinc.com:zybo-z7-20:part0:1.2 xc7z020clg400-1 zybo_radio ./zybo_radio
+#
+# For PYNQ-Z1: get the exact board_part string from your local board files
+# first. In the Vivado Tcl console, after registering your board files repo
+# path, run: get_board_parts -filter {NAME =~ *pynq*}
+# PYNQ-Z1 uses the same FPGA part as Zybo Z7-20, xc7z020clg400-1, so only
+# board_part should need to change, not part.
+#
+# Honesty check: assembled from well-established, standard Xilinx IP
+# config/automation patterns, but not run against a live Vivado install by
+# me. If a specific -dict property name errors out, Vivado's own error
+# message will name the exact valid key for your IP version - fix forward
+# from that rather than assuming the whole script is wrong. The most likely
+# spots to need adjustment are flagged inline below.
+
+if { [llength $argv] != 4 } {
+    puts "Usage: vivado -mode batch -source create_project.tcl -tclargs BOARD_PART PART PROJECT_NAME PROJECT_DIR"
+    exit 1
+}
+
+set board_part   [lindex $argv 0]
+set part         [lindex $argv 1]
+set project_name [lindex $argv 2]
+set project_dir  [lindex $argv 3]
+
+# Source tree location, resolved relative to this script so the project can
+# be created from anywhere.
+set script_dir [file normalize [file dirname [info script]]]
+set src_root   [file normalize "$script_dir/../dsp-cake/comms_dsp"]
+set hdl_dir    "$src_root/hdl"
+set tb_dir     "$src_root/test_bench"
+
+create_project $project_name $project_dir -part $part -force
+set_property board_part $board_part [current_project]
+
+# --- HDL sources ---------------------------------------------------------
+# reg_rw_interface.vhd and pll_2nd_order.vhd use /* */ block comments, which
+# are VHDL-2008 only - synthesis fails on them under the VHDL-93 default, so
+# the whole set is marked 2008 (harmless for the files that don't need it).
+add_files -norecurse [glob $hdl_dir/*.vhd]
+set_property file_type {VHDL 2008} [get_files -filter {FILE_TYPE == VHDL}]
+
+add_files -fileset sim_1 -norecurse [glob $tb_dir/*.vhd]
+set_property file_type {VHDL 2008} [get_files -of_objects [get_filesets sim_1] -filter {FILE_TYPE == VHDL}]
+
+# Testbench stimulus/coefficient data - not compiled, but kept with the
+# project so simulation can find them.
+add_files -fileset sim_1 -norecurse [glob -nocomplain $tb_dir/*.dat $tb_dir/*.mem $tb_dir/*.coe]
+
+# The NCO ROM init files must ALSO be design sources, not just simulation
+# sources. pll_2nd_order.vhd instantiates two xpm_memory_sprom with
+# MEMORY_INIT_FILE => "cos.mem" / "sine.mem", and those are read by SYNTHESIS -
+# which cannot see the sim_1 fileset at all. Adding them only to sim_1 gives:
+#
+#   [Synth 8-4445] could not open $readmem data file 'cos.mem' ... ignoring
+#
+# Note "ignoring": it is a WARNING, not an error. Synthesis completes, the
+# bitstream builds, and both ROMs come up filled with ZEROS - so the NCO emits
+# nothing, carrier recovery silently does nothing, and the failure only shows up
+# as a dead receiver on hardware. Simulation passes throughout, because the
+# simulator CAN see sim_1. Worth treating that warning as fatal.
+add_files -norecurse [glob -nocomplain $tb_dir/*.mem]
+
+# --- blk_mem_gen_2: register-space BRAM behind reg_rw_interface ----------
+# Not checked into the repo, so it's generated here to match the component
+# declaration in reg_rw_interface.vhd: single-port, 32-bit wide, 2048 deep
+# (11-bit address), with the reset pin + rsta_busy output enabled.
+create_ip -name blk_mem_gen -vendor xilinx.com -library ip -module_name blk_mem_gen_2
+set_property -dict [list \
+    CONFIG.Memory_Type {Single_Port_RAM} \
+    CONFIG.Write_Width_A {32} \
+    CONFIG.Write_Depth_A {2048} \
+    CONFIG.Read_Width_A {32} \
+    CONFIG.Use_RSTA_Pin {true} \
+    CONFIG.Reset_Memory_Latch_A {false} \
+    CONFIG.Enable_A {Use_ENA_Pin} \
+] [get_ips blk_mem_gen_2]
+
+# --- Block design --------------------------------------------------------
+create_bd_design "system"
+
+set ps7_vlnv [get_ipdefs -filter {NAME == processing_system7} -all]
+set ps [create_bd_cell -type ip -vlnv [lindex $ps7_vlnv 0] processing_system7_0]
+
+# Board-preset automation: wires up FIXED_IO/DDR external ports and applies
+# the board's own PS7 defaults (DDR timing, clocking) instead of the generic
+# Zynq reset defaults.
+set automation_config [list make_external {FIXED_IO, DDR} apply_board_preset {1} Master {Disable} Slave {Disable}]
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 -config $automation_config $ps
+
+# GP0 -> PL register block (via protocol converter, below)
+# GP1 -> DMA control/status
+# HP0/HP1 -> one per DMA channel, so TX and RX don't share DDR bandwidth
+# Fabric interrupt -> DMA transfer-complete back to the PS (for dma_proxy)
+set_property -dict [list \
+    CONFIG.PCW_USE_M_AXI_GP0 {1} \
+    CONFIG.PCW_USE_M_AXI_GP1 {1} \
+    CONFIG.PCW_USE_S_AXI_HP0 {1} \
+    CONFIG.PCW_USE_S_AXI_HP1 {1} \
+    CONFIG.PCW_USE_FABRIC_INTERRUPT {1} \
+    CONFIG.PCW_IRQ_F2P_INTR {1} \
+] $ps
+
+# --- AXI DMA: PL <-> PS DDR bulk data path -------------------------------
+# MM2S = DDR -> PL (samples out to the DSP chain)
+# S2MM = PL -> DDR (recovered frames back for the PS to read)
+#
+# SCATTER-GATHER DISABLED, changed from the original SG build. With SG on, the
+# IP does not expose the Simple-mode registers at all - S2MM_DA/S2MM_LENGTH
+# simply are not there - and every transfer has to go through descriptor chains
+# built in memory. That is the right design when a driver is chaining many
+# buffers without CPU involvement, which is what dma_proxy was there for.
+#
+# It is the wrong design here. The RX path delivers one frame of at most 255
+# bytes at a time, and userspace drives the DMA directly over UIO with no
+# kernel driver in the way. Simple mode makes that "write the address, write
+# the length, poll for done" - three registers instead of a descriptor
+# allocator and a coherency protocol for the descriptors themselves.
+#
+# Simple mode caps a transfer at 2**26-1 bytes, which is far more than a frame
+# or any stimulus buffer being pushed the other way.
+set dma_vlnv [get_ipdefs -filter {NAME == axi_dma} -all]
+set dma [create_bd_cell -type ip -vlnv [lindex $dma_vlnv 0] axi_dma_0]
+#
+# c_sg_include_stscntrl_strm MUST be held at 0 explicitly, not left to default.
+# The status/control stream is a Scatter-Gather feature, so it looks irrelevant
+# once SG is off - but leaving it at its default gives the IP a contradictory
+# configuration, and the IP's own config TCL then errors out with
+#
+#   [Ip 78-87]  Error found in procedure get_rule_options
+#   [Ip 78-92]  Failed to extract configurable options
+#   [axi_dma]   No valid slave interface could be found to connect to M_AXI_MM2S
+#
+# The last line is misleading: nothing is wrong with the slave, and HP0 is
+# enabled above. Automation just cannot query a cell whose configuration failed
+# to resolve, so the failure surfaces at the next apply_bd_automation call
+# rather than at the set_property that actually caused it.
+set_property -dict [list \
+    CONFIG.c_include_sg {0} \
+    CONFIG.c_sg_include_stscntrl_strm {0} \
+    CONFIG.c_include_mm2s {1} \
+    CONFIG.c_include_s2mm {1} \
+    CONFIG.c_m_axis_mm2s_tdata_width {32} \
+    CONFIG.c_s_axis_s2mm_tdata_width {32} \
+    CONFIG.c_mm2s_burst_size {16} \
+    CONFIG.c_s2mm_burst_size {16} \
+] $dma
+
+# --- AXI4-Lite bridge out to the PL register block -----------------------
+# The PS GP ports are AXI3; reg_rw_interface is an AXI4-Lite slave, so a
+# protocol converter sits between them. Its master side is exposed as an
+# external BD port for system_top.vhd to wire to reg_rw_interface.
+set conv_vlnv [get_ipdefs -filter {NAME == axi_protocol_converter} -all]
+set conv [create_bd_cell -type ip -vlnv [lindex $conv_vlnv 0] axi_protocol_converter_0]
+set_property -dict [list \
+    CONFIG.SI_PROTOCOL {AXI3} \
+    CONFIG.MI_PROTOCOL {AXI4LITE} \
+    CONFIG.DATA_WIDTH {32} \
+] $conv
+
+# --- Reset generator for the PL-side AXI infrastructure ------------------
+# Created explicitly (rather than letting automation spawn one with an
+# unpredictable name) so the manual converter wiring below has a known
+# reset net to attach to.
+set rst_vlnv [get_ipdefs -filter {NAME == proc_sys_reset} -all]
+set rstgen [create_bd_cell -type ip -vlnv [lindex $rst_vlnv 0] proc_sys_reset_0]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0]     [get_bd_pins proc_sys_reset_0/slowest_sync_clk]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_pins proc_sys_reset_0/ext_reset_in]
+
+# --- Wire it up ----------------------------------------------------------
+# Automation handles the real addressable endpoints (DMA, HP ports). The
+# protocol converter has to be wired by hand: apply_bd_automation's axi4
+# rule rejects it with "does not contain any address segments", because a
+# converter is a transparent bridge with no address space of its own - the
+# rule only works against actual addressable slaves.
+
+# GP0 -> protocol converter (-> external, to PL register block).
+# GP0's ACLK has to be driven explicitly here too; automation would
+# normally have done that for us.
+connect_bd_intf_net [get_bd_intf_pins processing_system7_0/M_AXI_GP0] [get_bd_intf_pins axi_protocol_converter_0/S_AXI]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0]        [get_bd_pins processing_system7_0/M_AXI_GP0_ACLK]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0]        [get_bd_pins axi_protocol_converter_0/aclk]
+connect_bd_net [get_bd_pins proc_sys_reset_0/peripheral_aresetn]   [get_bd_pins axi_protocol_converter_0/aresetn]
+
+# GP1 -> DMA control/status
+apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
+    Master {/processing_system7_0/M_AXI_GP1} Slave {/axi_dma_0/S_AXI_LITE} \
+    intc_ip {Auto} Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
+] [get_bd_intf_pins axi_dma_0/S_AXI_LITE]
+
+# --- Data plane: DMA masters -> HP ports, wired by hand ------------------
+#
+# These two paths used to use apply_bd_automation. They no longer do, because
+# automation failed here in three different ways over the life of this script:
+#
+#   1. It flatly refuses the protocol converter above ("does not contain any
+#      address segments") - a transparent bridge has no address space.
+#   2. Re-automating a slave that already carried traffic spawned a SECOND
+#      interconnect whose master went nowhere, which is what left Data_SG
+#      unmapped on the first build that reached bitstream.
+#   3. With Scatter-Gather disabled it reports
+#        [Ip 78-87] Error found in procedure get_rule_options
+#        [axi_dma]  No valid slave interface could be found to connect to
+#                   </axi_dma_0/M_AXI_MM2S>
+#      even though S_AXI_HP0 is enabled above and automation can interrogate
+#      the same DMA cell happily for its S_AXI_LITE slave port.
+#
+# Automation's appeal is that it infers interconnects, clocks, resets and
+# addresses. All four are written out explicitly below. It is more lines, but
+# every one of them is inspectable, and a failure names the pin that is wrong
+# instead of surfacing at whatever call happens to run next.
+#
+# An interconnect is genuinely required on each path, not optional: the DMA
+# masters are AXI4 and the Zynq HP slaves are AXI3, and the data widths differ
+# (32-bit master into a 64-bit HP port). axi_interconnect performs both
+# conversions.
+
+# Pick the NEWEST version, not the first match. get_ipdefs -all returns every
+# version in the catalog, and axi_interconnect ships as both 1.7 and 2.1 - with
+# 1.7 sorting first, so [lindex ... 0] selects a version Vivado then refuses:
+#
+#   [BD 5-313] Found unsupported IP 'xilinx.com:ip:axi_interconnect:1.7'
+#
+# VLNV is vendor:library:name:version, so a dictionary sort puts the highest
+# version last. The other IP lookups in this script happen to be single-version
+# and are left alone.
+proc latest_ipdef {name} {
+    set defs [get_ipdefs -all -filter "NAME == $name"]
+    if {[llength $defs] == 0} {
+        error "no IP definition found for '$name' - is the IP catalog available?"
+    }
+    return [lindex [lsort -increasing -dictionary $defs] end]
+}
+
+set ic_vlnv [latest_ipdef axi_interconnect]
+puts "Using interconnect: $ic_vlnv"
+
+# Connects only if the pin is currently unconnected. The GP1 automation above
+# has already driven some of the DMA's clock/reset pins, and connect_bd_net
+# errors on an already-driven pin rather than ignoring it.
+proc safe_net {src dst} {
+    set d [get_bd_pins -quiet $dst]
+    if {[llength $d] == 0} { return }
+    if {[llength [get_bd_nets -quiet -of_objects $d]] == 0} {
+        connect_bd_net [get_bd_pins $src] $d
+    }
+}
+
+# One 1x1 interconnect per HP port. Separate ports rather than a shared one so
+# the transmit and receive paths do not contend for the same DDR interface.
+proc wire_dma_to_hp {ic_vlnv inst master hp} {
+    set ic [create_bd_cell -type ip -vlnv $ic_vlnv $inst]
+    set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] $ic
+
+    connect_bd_intf_net [get_bd_intf_pins $master]      [get_bd_intf_pins $inst/S00_AXI]
+    connect_bd_intf_net [get_bd_intf_pins $inst/M00_AXI] [get_bd_intf_pins processing_system7_0/$hp]
+
+    foreach p [list ACLK S00_ACLK M00_ACLK] {
+        safe_net processing_system7_0/FCLK_CLK0 $inst/$p
+    }
+    safe_net processing_system7_0/FCLK_CLK0 processing_system7_0/${hp}_ACLK
+
+    # The interconnect's own ARESETN is the interconnect-domain reset; the
+    # per-port ones are peripheral resets. They are different nets on purpose.
+    safe_net proc_sys_reset_0/interconnect_aresetn $inst/ARESETN
+    foreach p [list S00_ARESETN M00_ARESETN] {
+        safe_net proc_sys_reset_0/peripheral_aresetn $inst/$p
+    }
+}
+
+wire_dma_to_hp $ic_vlnv axi_mem_intercon_0 axi_dma_0/M_AXI_MM2S S_AXI_HP0
+wire_dma_to_hp $ic_vlnv axi_mem_intercon_1 axi_dma_0/M_AXI_S2MM S_AXI_HP1
+
+# The DMA's own clocks and reset. m_axi_sg_aclk is deliberately absent - it
+# does not exist with Scatter-Gather disabled.
+foreach p [list s_axi_lite_aclk m_axi_mm2s_aclk m_axi_s2mm_aclk] {
+    safe_net processing_system7_0/FCLK_CLK0 axi_dma_0/$p
+}
+safe_net proc_sys_reset_0/peripheral_aresetn axi_dma_0/axi_resetn
+
+# The M_AXI_SG master and its Data_SG address space no longer exist now that
+# SG is disabled, so the descriptor-fetch path that used to be automated onto
+# HP0 here is gone with them. (It was also the source of an earlier bug: it had
+# to target the master pin rather than the HP slave pin, because re-automating
+# a slave HP0 already carried spawned a second interconnect whose master went
+# nowhere, leaving Data_SG as an incomplete path in the address editor.)
+
+# --- Interrupts ----------------------------------------------------------
+set concat_vlnv [get_ipdefs -filter {NAME == xlconcat} -all]
+set irq_concat [create_bd_cell -type ip -vlnv [lindex $concat_vlnv 0] xlconcat_0]
+set_property -dict [list CONFIG.NUM_PORTS {2}] $irq_concat
+
+connect_bd_net [get_bd_pins axi_dma_0/mm2s_introut] [get_bd_pins xlconcat_0/In0]
+connect_bd_net [get_bd_pins axi_dma_0/s2mm_introut] [get_bd_pins xlconcat_0/In1]
+connect_bd_net [get_bd_pins xlconcat_0/dout] [get_bd_pins processing_system7_0/IRQ_F2P]
+
+# --- Expose the PL-facing interfaces -------------------------------------
+# Port names must match what system_top.vhd expects on the wrapper.
+# make_bd_intf_pins_external is deliberately NOT used here: its auto-naming
+# isn't predictable across versions and it returns nothing to rename (both
+# of which broke earlier versions of this script). Creating the ports
+# explicitly and connecting them gives exact, deterministic names.
+#
+# Mode is from the BD's perspective looking outward: MM2S sources data out
+# of the BD (Master), S2MM sinks data into it (Slave).
+create_bd_intf_port -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 M_AXIS_MM2S_0
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXIS_MM2S] [get_bd_intf_ports M_AXIS_MM2S_0]
+
+create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 S_AXIS_S2MM_0
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM] [get_bd_intf_ports S_AXIS_S2MM_0]
+
+create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_REGS_0
+connect_bd_intf_net [get_bd_intf_pins axi_protocol_converter_0/M_AXI] [get_bd_intf_ports M_AXI_REGS_0]
+
+create_bd_port -dir O -type clk fclk
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0] [get_bd_ports fclk]
+
+create_bd_port -dir O -type rst fclk_resetn
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_ports fclk_resetn]
+
+# --- Port parameters, set AFTER connecting -------------------------------
+# Explicitly created ports default to 100 MHz / 1-byte TDATA / AXI4, none of
+# which match the IP side. Setting these before connecting doesn't stick -
+# parameter propagation on connect overwrites them - so it has to happen
+# here. ASSOCIATED_BUSIF ties the interfaces to the clock port so Vivado
+# propagates the frequency instead of falling back to its default.
+set pl_freq [get_property CONFIG.FREQ_HZ [get_bd_pins processing_system7_0/FCLK_CLK0]]
+if { $pl_freq eq "" } { set pl_freq 50000000 }
+
+set_property -dict [list \
+    CONFIG.FREQ_HZ $pl_freq \
+    CONFIG.ASSOCIATED_BUSIF {M_AXIS_MM2S_0:S_AXIS_S2MM_0:M_AXI_REGS_0} \
+] [get_bd_ports fclk]
+
+set axis_props [list \
+    CONFIG.FREQ_HZ $pl_freq \
+    CONFIG.TDATA_NUM_BYTES {4} \
+    CONFIG.HAS_TLAST {1} \
+    CONFIG.HAS_TKEEP {1} \
+    CONFIG.HAS_TREADY {1} \
+]
+set_property -dict $axis_props [get_bd_intf_ports M_AXIS_MM2S_0]
+set_property -dict $axis_props [get_bd_intf_ports S_AXIS_S2MM_0]
+
+set_property -dict [list \
+    CONFIG.PROTOCOL {AXI4LITE} \
+    CONFIG.FREQ_HZ $pl_freq \
+    CONFIG.ADDR_WIDTH {32} \
+    CONFIG.DATA_WIDTH {32} \
+] [get_bd_intf_ports M_AXI_REGS_0]
+
+assign_bd_address
+
+# Both data-plane masters must reach DDR, or the design still builds and the
+# DMA silently does nothing at runtime - an unmapped address space is not a
+# build error. This used to guard Data_SG, which was the one that actually came
+# up unmapped on the first build that reached bitstream; with SG disabled the
+# same check applies to the two remaining spaces.
+foreach {space seg} {
+    axi_dma_0/Data_MM2S processing_system7_0/S_AXI_HP0/HP0_DDR_LOWOCM
+    axi_dma_0/Data_S2MM processing_system7_0/S_AXI_HP1/HP1_DDR_LOWOCM
+} {
+    if { [llength [get_bd_addr_segs -addressables -of_objects [get_bd_addr_spaces $space]]] == 0 } {
+        puts "WARNING: $space came up unmapped; assigning to $seg explicitly"
+        assign_bd_address -target_address_space [get_bd_addr_spaces $space] \
+            [get_bd_addr_segs $seg]
+    }
+}
+
+save_bd_design
+validate_bd_design
+
+# --- Wrapper + top -------------------------------------------------------
+# The BD wrapper is generated as a source but is NOT the top - system_top.vhd
+# instantiates it and is the real design top.
+set wrapper [make_wrapper -files [get_files "$project_dir/$project_name.srcs/sources_1/bd/system/system.bd"] -top]
+add_files -norecurse $wrapper
+update_compile_order -fileset sources_1
+set_property top system_top [get_filesets sources_1]
+update_compile_order -fileset sources_1
+
+puts "Project created: $project_dir/$project_name.xpr"
+puts "Top: system_top (from $hdl_dir/system_top.vhd)"
+puts "Check the generated system_wrapper port names against system_top.vhd's port map if elaboration complains."

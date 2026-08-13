@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0+
+//
+// Zybo Z7-20 with the comms DSP PL design.
+//
+// Includes the stock board dts so every PS peripheral (GEM/Ethernet, SD,
+// UART, USB) is inherited unchanged - only PL nodes are added below.
+// Addresses come from the block design's Address Editor.
+//
+// Note the xilinx/ prefix on the include: this kernel moved ARM dts files
+// into per-vendor subdirectories, and BR2_LINUX_KERNEL_CUSTOM_DTS_PATH
+// copies this file into the flat arch/arm/boot/dts/ root, so an unqualified
+// include won't resolve.
+
+/dts-v1/;
+#include "xilinx/zynq-zybo-z7.dts"
+
+/ {
+	/*
+	 * Zybo Z7-20 has 1 GB of DDR. The top 16 MB is carved out of the
+	 * kernel's memory node so nothing else can allocate from it, and
+	 * handed to the PL DMA as a fixed, physically contiguous buffer.
+	 *
+	 * The kernel must not own this region. Shrinking the memory node is
+	 * the bluntest way to guarantee that, and unlike CMA it gives a
+	 * compile-time-known physical address with no allocator involved -
+	 * which is what a userspace-driven DMA needs, since userspace has to
+	 * hand the DMA a bus address directly.
+	 *
+	 * NOTE this address is board-specific: PYNQ-Z1 has 512 MB, so its
+	 * equivalent region is at 0x1f000000. Any board bringing up this PL
+	 * design needs its own values here.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x3f000000>;
+	};
+};
+
+&clkc {
+	assigned-clocks = <&clkc 15>;
+	assigned-clock-rates = <50000000>;	/* FCLK0, clocks the PL */
+};
+
+&amba {
+	/*
+	 * AXI DMA control interface, on GP1 at 0x8040_0000 (64K).
+	 *
+	 * Bound to UIO, NOT to the in-kernel xilinx_dma driver. The kernel
+	 * driver is a dmaengine provider, and dmaengine has no userspace API -
+	 * reaching it from an application means an out-of-tree shim like
+	 * dma_proxy. Since the whole datapath here is one application driving
+	 * one DMA, UIO removes the kernel from the loop entirely: userspace
+	 * mmaps these registers and writes them.
+	 *
+	 * The IP is built in Simple mode (SG disabled in create_project.tcl),
+	 * so a transfer is: write the destination address, write the length,
+	 * poll for completion. The xlnx,* properties the dmaengine driver
+	 * parsed are gone along with it.
+	 *
+	 * Only the S2MM interrupt is listed. uio_pdrv_genirq binds exactly one
+	 * IRQ - platform_get_irq(pdev, 0) - so listing MM2S first would wire up
+	 * the wrong one. RX completion is what an application needs to block
+	 * on; the TX side is polled.
+	 */
+	axi_dma_0: uio@80400000 {
+		compatible = "generic-uio";
+		reg = <0x80400000 0x10000>;
+		clocks = <&clkc 15>;
+		interrupt-parent = <&intc>;
+		interrupts = <0 30 4>;	/* S2MM (MM2S is 29) */
+	};
+
+	/* reg_rw_interface's AXI4-Lite window, on GP0 at 0x43C0_0000 (64K).
+	 * Exposed to userspace via UIO rather than a custom kernel driver.
+	 */
+	user_regs: uio@43c00000 {
+		compatible = "generic-uio";
+		reg = <0x43c00000 0x10000>;
+		clocks = <&clkc 15>;
+	};
+
+	/*
+	 * The reserved DDR carved out above, exposed as a UIO device so
+	 * userspace gets both the mapping and the physical address without
+	 * hardcoding either - /sys/class/uio/uioN/maps/map0/addr carries the
+	 * bus address to program into the DMA.
+	 *
+	 * Mapping it through UIO rather than /dev/mem also gets the caching
+	 * right: uio_pdrv_genirq maps UIO_MEM_PHYS with pgprot_noncached, and
+	 * the Zynq HP ports are not cache-coherent with the CPU. Through a
+	 * normal cached mapping the CPU would happily serve stale lines for
+	 * data the PL had just written.
+	 */
+	dma_buf: uio@3f000000 {
+		compatible = "generic-uio";
+		reg = <0x3f000000 0x1000000>;
+	};
+};

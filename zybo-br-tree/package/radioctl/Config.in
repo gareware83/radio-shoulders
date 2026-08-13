@@ -1,0 +1,10 @@
+
+config BR2_PACKAGE_RADIOCTL
+	bool "radioctl"
+	help
+	  Command line tool for the comms DSP radio register space.
+	  Maps the PL register window via UIO and exposes register
+	  read/write plus role/enable/transmit helpers.
+
+	  Requires the generic-uio devicetree node and
+	  uio_pdrv_genirq.of_id=generic-uio on the kernel command line.

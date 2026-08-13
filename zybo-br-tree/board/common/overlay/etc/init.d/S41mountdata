@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# Mount the persistent ext4 data partition at /mnt/data, unless it's
+# already mounted (as root, in the persistent-root boot config) - avoids
+# mounting /dev/mmcblk0p2 a second time on top of itself.
+#
+
+start() {
+	if ! grep -q '^/dev/mmcblk0p2 ' /proc/mounts; then
+		printf "Mounting /dev/mmcblk0p2 at /mnt/data: "
+		mount /dev/mmcblk0p2 /mnt/data
+		[ $? = 0 ] && echo "OK" || echo "FAIL"
+	fi
+}
+
+stop() {
+	if grep -q '^/dev/mmcblk0p2 /mnt/data ' /proc/mounts; then
+		umount /mnt/data
+	fi
+}
+
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  restart|reload)
+	stop
+	start
+	;;
+  *)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac
+
+exit $?

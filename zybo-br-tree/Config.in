@@ -1,0 +1,2 @@
+source "$BR2_EXTERNAL_ZYBO_Z7_PATH/package/crc32_example/Config.in"
+source "$BR2_EXTERNAL_ZYBO_Z7_PATH/package/radioctl/Config.in"

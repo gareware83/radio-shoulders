@@ -1,0 +1,46 @@
+# --- Buildroot ---------------------------------------------------------
+# Cloned separately (or added as a submodule); build_all.sh expects it at
+# the repo root as ../buildroot relative to zybo-br-tree.
+buildroot/
+
+# Buildroot output trees. Note the pattern has no hyphen: the trees are
+# named output/, output-zybo/ and output-pynq/, and an "output-*" pattern
+# silently misses the first one - each is ~7 GB.
+zybo-br-tree/output*/
+
+# --- Vivado ------------------------------------------------------------
+# The whole project is regenerable from create_project.tcl, which is the
+# source of truth. Ignore everything under vivado/ except the script.
+vivado/*
+!vivado/create_project.tcl
+
+*.jou
+*.log
+*.str
+.Xil/
+*.wdb
+*.wcfg
+*.pb
+vivado_*.backup.*
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.pyc
+
+# --- Editor / OS -------------------------------------------------------
+.~lock*
+*.swp
+.DS_Store
+
+# --- Generated stimulus ------------------------------------------------
+# Regenerable in one command from waveform_generator.py, and ddc_input.dat
+# changes whenever impairments are retuned - not worth versioning the churn.
+#
+# NOT ignored: cos.mem / sine.mem / *.coe. Those are NCO ROM contents that
+# synthesis reads, so a build depends on them; and zybo_radio.bit, which the
+# rootfs build needs without requiring anyone to run Vivado first.
+dsp-cake/comms_dsp/test_bench/ddc_input.dat
+dsp-cake/comms_dsp/test_bench/qpsk_symbols.dat
+dsp-cake/comms_dsp/test_bench/rx_expected.txt
+dsp-cake/comms_dsp/test_bench/rx_expected_stream.dat
+dsp-cake/comms_dsp/test_bench/pure_*.dat
