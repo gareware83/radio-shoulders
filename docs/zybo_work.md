@@ -1161,6 +1161,21 @@ Changing the busybox config requires `make busybox-rebuild`, or the applet set i
 
 Live state at the end of the last working session. Nothing here is settled.
 
+### 0. State of the board and tree right now
+
+The board boots persistent root and responds to `radioctl` again. Three things are still out of step with the tree, and each will waste time if not handled first.
+
+| Thing | State | Consequence |
+|---|---|---|
+| Loaded bitstream | Built from a **hand-edited block design**, not regenerated from `create_project.tcl` | The pinned `0x43C0_0000`, the address-map check, `rx_quality` and `BUILD_ID` are all **untested in hardware** |
+| `radioctl` on the board | Older binary, no `build` command | `radioctl read build` returns "unknown register" — needs `radioctl-rebuild` plus a rootfs update |
+| `BUILD_ID` register | Not in the loaded bitstream | Even with a new `radioctl`, `word_index` clamps the read and returns the top implemented register — a plausible-looking wrong answer rather than an error |
+| `clk_ignore_unused` | Now in both `boot.cmd` files | Confirm the `boot.scr` on the FAT partition was regenerated; otherwise it only applies when typed by hand at the U-Boot prompt |
+
+**Next action, and it unblocks the rest:** regenerate the Vivado project from `create_project.tcl` and rebuild. That is the first exercise of the pinned address, the fatal address-map check, `latest_ipdef`, the manual interconnect wiring and `build_id.vhd` generation — all written, none proven. Then `radioctl-rebuild`, update the rootfs, and `radioctl read build` should return the commit hash.
+
+Avoid another hand edit to the BD: it and the script have now diverged, and the script is meant to be the source of truth.
+
 ### 1. `ddc_input.dat` is currently a ZERO-IMPAIRMENT bisect stimulus
 
 **This is the single easiest thing to be confused by.** The file on disk right now has no timing offset, no clock error, no carrier residual and no noise — it is not the default `run_frames()` output. It was regenerated deliberately to split one question in two.
@@ -1225,8 +1240,6 @@ Complication worth resolving before tuning anything: **the devicetree runs FCLK0
 If it is genuinely tight at the real clock rate, the fix is a pipeline register in the matched filter accumulator — the 9-tap sum currently resolves in one cycle.
 
 ### 5. Repo split
-
-### 4. Repo split
 
 Work is moving to `radio-shoulders` (flattened single repo; nested `dsp-cake` and `zybo-br-tree` `.git` dirs removed). `zybo_NEW` retains the originals including the `gareware83/dsp-cake` remote.
 

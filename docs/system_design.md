@@ -435,7 +435,7 @@ rootfs.
 ```
 radioctl <command>
 
-  dump                  every register, decoded, plus DMA buffer location
+  dump                  every register, decoded
   read  <reg>           read one register
   write <reg> <value>   write one register (hex or decimal)
 
@@ -445,11 +445,90 @@ radioctl <command>
   transmit [len]        pulse TX_START, optionally setting TX_LEN first
   clrstats              pulse CLR_STATS
 
+  dmainfo               DMA buffer location and status (maps the DMA)
   rx [timeout_ms]       arm the DMA, wait for one frame, print it
   rxloop [timeout_ms]   same, repeating until interrupted
-
-registers: id, control, mode, status, tx_len, rx_len, frames, errors
 ```
+
+`dump` and `read` touch only the register window. `dmainfo`, `rx` and `rxloop`
+additionally map the DMA control window — stay on the first two whenever the
+PL's state is uncertain, since an unclocked or unprogrammed PL hard-locks the
+CPU on any access it cannot answer.
+
+#### Registers and access
+
+| Name | Offset | Access | Meaning |
+|---|---|---|---|
+| `id` | `0x00` | R | `0x5A790001` = expected bitstream; anything else means wrong or unloaded PL |
+| `control` | `0x04` | R/W | Enable and command pulses |
+| `mode` | `0x08` | R/W | Role and modulation select |
+| `status` | `0x0C` | R | Chain state, driven from PL |
+| `tx_len` | `0x10` | R/W | Transmit payload length, 0–255 bytes |
+| `rx_len` | `0x14` | R | Payload length of the last good frame |
+| `frames` | `0x18` | R | Frames passing CRC since reset |
+| `errors` | `0x1C` | R | Frames failing CRC since reset |
+| `syncs` | `0x20` | R | Sync-word detections, whether or not CRC later passed |
+| `qmin` | `0x24` | R | Accumulator, sum of min(abs I, abs Q) |
+| `qmax` | `0x28` | R | Accumulator, sum of max(abs I, abs Q) |
+| `qsyms` | `0x2C` | R | Symbols covered by the two accumulators |
+| `build` | `0x30` | R | First 32 bits of the git commit the bitstream was built from |
+
+#### Values you can write
+
+**`control` (0x04)** — bits 1 and 3 are write-one pulses that self-clear in the
+PL, so reading them back as 0 is correct behaviour, not a failed write.
+
+| Bit | Value | Effect |
+|---|---|---|
+| 0 | `0x1` | `ENABLE` — master enable, level |
+| 1 | `0x2` | `TX_START` — pulse, self-clearing |
+| 2 | `0x4` | `RX_ENABLE` — enables `frame_sync`; low holds it in reset |
+| 3 | `0x8` | `CLR_STATS` — pulse; zeroes counters and quality accumulators |
+
+```bash
+radioctl write control 0x5     # ENABLE + RX_ENABLE   (same as: radioctl listen)
+radioctl write control 0x9     # ENABLE + CLR_STATS   (same as: radioctl clrstats)
+```
+
+**`mode` (0x08)**
+
+| Bits | Value | Effect |
+|---|---|---|
+| 0 | `0x0` / `0x1` | `ROLE`: 0 = RX, 1 = TX |
+| 3:1 | — | `MOD`, modulation select — reserved, unused |
+| 7:4 | — | `SPREAD`, DSSS factor — reserved, unused |
+
+**`tx_len` (0x10)** — payload bytes, 0–255. Larger values exceed the frame
+format's 8-bit length field.
+
+#### What read values mean
+
+| Read | Value | Means |
+|---|---|---|
+| `id` | `0x5A790001` | Correct bitstream loaded |
+| `id` | hangs the board | PL unclocked or unprogrammed — see `clk_ignore_unused` in `zybo_work.md` |
+| `id` | anything else | Wrong bitstream |
+| `build` | matches `git rev-parse --short=8 HEAD` | PL was built from this tree |
+| `build` | `0xffffffff` | Built with git unavailable |
+| `build` with `BUILD_DIRTY` set | — | Hash is a lower bound; tree had uncommitted changes |
+| `frames`, `errors` | both 0 | No sync at all — check `syncs` next |
+| `syncs` > 0 but `frames` = 0 | — | Sync fires, CRC fails: symbol errors inside the frame body |
+| `qmin`/`qmax` | approaching 1.0 | Clean constellation, sitting on the diagonal |
+| `qmin`/`qmax` | below 0.7 | Poor lock — phase error, ISI or noise |
+| `rx_len` | 0–255 | Payload bytes in the last good frame |
+
+**`status` (0x0C) bits**
+
+| Bit | Name | Set means |
+|---|---|---|
+| 0 | `TX_BUSY` | Transmit in progress — *tied 0, no TX chain yet* |
+| 1 | `PLL_LOCKED` | Carrier locked — *tied 0, no lock detector yet* |
+| 2 | `FRAME_VALID` | `frame_sync` is past its hunt state |
+| 3 | `OVERFLOW` | A frame was dropped because the buffer was still draining |
+| 4 | `BUILD_DIRTY` | Bitstream built from a tree with uncommitted changes |
+
+`clrstats` resets `frames`, `errors`, `syncs` and the quality accumulators.
+`id` and `build` are constants in fabric and are unaffected.
 
 ### 5.3 RX receive sequence
 
@@ -457,28 +536,29 @@ registers: id, control, mode, status, tx_len, rx_len, frames, errors
 sequenceDiagram
     participant App as radioctl
     participant Regs as PL registers
-    participant DMA as AXI DMA (S2MM)
+    participant DMA as AXI DMA S2MM
     participant PL as dsp_top
     participant Buf as reserved DDR
 
-    App->>Regs: CONTROL |= ENABLE | RX_ENABLE
-    Note over App,Regs: arm the receiver first — a frame landing<br/>before the DMA is armed is dropped as overflow
+    App->>Regs: set CONTROL.ENABLE and CONTROL.RX_ENABLE
+    Note over App,Regs: arm the receiver first - a frame landing<br/>before the DMA is armed is dropped as overflow
 
-    App->>DMA: DMACR.Reset, poll until self-clear
-    App->>DMA: S2MM_DA = buffer physical address
-    App->>DMA: DMACR.RS = 1
-    App->>DMA: S2MM_LENGTH = capacity (starts transfer)
+    App->>DMA: write DMACR.Reset, poll until self-clear
+    App->>DMA: write S2MM_DA with buffer physical address
+    App->>DMA: set DMACR.RS
+    App->>DMA: write S2MM_LENGTH - this starts the transfer
 
-    PL->>PL: sync → header → payload → CRC
+    PL->>PL: sync, header, payload, CRC
+
     alt CRC passes
-        PL->>DMA: metadata word + payload, TLAST
+        PL->>DMA: metadata word plus payload, TLAST
         DMA->>Buf: write
         DMA-->>App: DMASR.IOC_Irq
-        App->>DMA: read S2MM_LENGTH → actual bytes
+        App->>DMA: read S2MM_LENGTH for actual byte count
         App->>Buf: parse metadata, read payload
     else CRC fails
-        PL->>PL: discard, ERR_COUNT++
-        Note over App: transfer never completes;<br/>caller times out
+        PL->>PL: discard frame, increment ERR_COUNT
+        Note over App,PL: transfer never completes,<br/>caller times out
     end
 ```
 
