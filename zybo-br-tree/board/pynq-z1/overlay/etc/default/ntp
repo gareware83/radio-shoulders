@@ -1,0 +1,14 @@
+# Time source for S49ntp.
+#
+# The dev host, not a public pool: there is no DNS configured on these boards
+# (no resolv.conf anywhere in the overlay), so a hostname would not resolve,
+# and no route to the internet is wanted or needed.
+#
+# Syncing both boards to the same local server also makes them agree with EACH
+# OTHER, which matters more than absolute accuracy once TX logs on one board
+# are being correlated against RX logs on the other.
+#
+# NOTE this is a DHCP address on the dev host's wifi - if time sync stops
+# working, check it is still correct before assuming anything is broken. A
+# static lease on the router avoids the problem.
+NTP_SERVER=10.0.0.191

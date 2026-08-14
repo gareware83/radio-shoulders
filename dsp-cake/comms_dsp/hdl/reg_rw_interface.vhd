@@ -224,7 +224,8 @@ begin
                         when C_REG_STATUS | C_REG_RX_LEN
                            | C_REG_FRAME_COUNT | C_REG_ERR_COUNT
                            | C_REG_SYNC_COUNT | C_REG_QUAL_MIN
-                           | C_REG_QUAL_MAX   | C_REG_QUAL_SYMS =>
+                           | C_REG_QUAL_MAX   | C_REG_QUAL_SYMS
+                           | C_REG_BUILD_ID =>
                             rdata_i <= status_reg(idx);
 
                         when others =>

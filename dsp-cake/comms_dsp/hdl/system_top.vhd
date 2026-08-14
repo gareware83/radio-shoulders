@@ -10,6 +10,7 @@ library work;
 use work.all;
 use work.dsp_pkg.all;
 use work.pkg.all;
+use work.build_id_pkg.all;
 
 -- Top level for the comms DSP PL design.
 --
@@ -144,6 +145,11 @@ begin
     status_reg(C_REG_QUAL_MIN)                 <= std_logic_vector(rx_qual_min);
     status_reg(C_REG_QUAL_MAX)                 <= std_logic_vector(rx_qual_max);
     status_reg(C_REG_QUAL_SYMS)                <= std_logic_vector(rx_qual_syms);
+
+    -- Which git commit this bitstream was built from, and whether the tree was
+    -- clean at the time. Constants from the generated build_id_pkg.
+    status_reg(C_REG_BUILD_ID)                 <= C_BUILD_ID;
+    status_reg(C_REG_STATUS)(C_STAT_BUILD_DIRTY) <= C_BUILD_DIRTY;
 end process;
 
 -- PS7 hands out an active-low reset; dsp_top wants active high, the AXI

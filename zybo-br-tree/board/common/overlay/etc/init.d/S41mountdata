@@ -1,20 +1,50 @@
 #!/bin/sh
 #
-# Mount the persistent ext4 data partition at /mnt/data, unless it's
-# already mounted (as root, in the persistent-root boot config) - avoids
-# mounting /dev/mmcblk0p2 a second time on top of itself.
+# Mount the persistent ext4 partition at /mnt/data - but only when it is not
+# already the root filesystem.
 #
+# In the persistent-root boot configuration the kernel mounts /dev/mmcblk0p2 as
+# /, and mounting it again at /mnt/data gives one filesystem at two paths.
+# Linux permits that, but it is confusing to reason about and awkward to
+# unmount or fsck cleanly.
+#
+# THE OBVIOUS CHECK DOES NOT WORK. Grepping /proc/mounts for '^/dev/mmcblk0p2 '
+# misses, because the kernel reports the root device it was handed on the
+# command line as /dev/root, not by its real name:
+#
+#     /dev/root / ext4 rw,relatime 0 0
+#
+# so the guard silently failed and the partition was mounted twice. Both checks
+# below cover it: what the kernel was ASKED to use as root, and what is actually
+# mounted there under either name.
+
+DEV=/dev/mmcblk0p2
+
+is_root_dev() {
+	# What the kernel was told to boot from.
+	grep -q "root=$DEV\([[:space:]]\|$\)" /proc/cmdline && return 0
+
+	# What is actually mounted at / - /dev/root is the kernel's alias for
+	# the boot device, so either name means the same partition here.
+	awk '$2 == "/" { print $1 }' /proc/mounts \
+		| grep -qE "^($DEV|/dev/root)$" && return 0
+
+	return 1
+}
 
 start() {
-	if ! grep -q '^/dev/mmcblk0p2 ' /proc/mounts; then
-		printf "Mounting /dev/mmcblk0p2 at /mnt/data: "
-		mount /dev/mmcblk0p2 /mnt/data
-		[ $? = 0 ] && echo "OK" || echo "FAIL"
+	if is_root_dev; then
+		echo "$DEV is already mounted as root, not mounting at /mnt/data"
+		return 0
 	fi
+
+	printf "Mounting %s at /mnt/data: " "$DEV"
+	mount "$DEV" /mnt/data
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
 }
 
 stop() {
-	if grep -q '^/dev/mmcblk0p2 /mnt/data ' /proc/mounts; then
+	if grep -q "^$DEV /mnt/data " /proc/mounts; then
 		umount /mnt/data
 	fi
 }

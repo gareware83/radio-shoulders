@@ -51,6 +51,7 @@ enum {
 	REG_QUAL_MIN    = 9,
 	REG_QUAL_MAX    = 10,
 	REG_QUAL_SYMS   = 11,
+	REG_BUILD_ID    = 12,
 	REG_COUNT
 };
 
@@ -68,6 +69,7 @@ enum {
 #define STAT_PLL_LOCKED  (1u << 1)
 #define STAT_FRAME_VALID (1u << 2)
 #define STAT_OVERFLOW    (1u << 3)
+#define STAT_BUILD_DIRTY (1u << 4)
 
 #define ID_MAGIC 0x5A790001u
 
@@ -118,6 +120,7 @@ static const struct {
 	{ "qmin",    REG_QUAL_MIN,    0 },
 	{ "qmax",    REG_QUAL_MAX,    0 },
 	{ "qsyms",   REG_QUAL_SYMS,   0 },
+	{ "build",   REG_BUILD_ID,    0 },
 };
 
 static volatile uint32_t *base;      /* register window */
@@ -338,6 +341,13 @@ static void dump(void)
 
 	printf("id          0x%08x %s\n", id,
 	       id == ID_MAGIC ? "(ok)" : "(UNEXPECTED - wrong bitstream?)");
+	/* Printed right after the ID because it qualifies every line below it:
+	 * a dirty build means these registers may not be the ones in this
+	 * source tree. */
+	uint32_t bid = rd(REG_BUILD_ID);
+	printf("build       %08x %s\n", bid,
+	       (st & STAT_BUILD_DIRTY) ? "(DIRTY - built with uncommitted changes)"
+	                               : "(clean)");
 	printf("control     0x%08x\n", rd(REG_CONTROL));
 	printf("mode        0x%08x  role=%s\n", md, (md & MODE_ROLE) ? "TX" : "RX");
 	printf("status      0x%08x  tx_busy=%d pll_locked=%d in_frame=%d overflow=%d\n",
@@ -361,7 +371,6 @@ static void dump(void)
 		       ((double)qmin / (double)qmax) < 0.70 ? "  (POOR LOCK)" : "");
 	else
 		printf("no symbols measured\n");
-	printf("dma buffer  0x%08lx (%lu KiB)\n", buf_phys, buf_size / 1024);
 }
 
 static void usage(const char *p)
@@ -442,8 +451,20 @@ int main(int argc, char **argv)
 	int rc = 0;
 
 	if (!strcmp(cmd, "dump")) {
-		if (map_datapath() < 0)
-			buf_phys = buf_size = 0;
+		/*
+		 * Registers only. dump() used to call map_datapath() as well,
+		 * purely to print the DMA buffer address - but that mapped the
+		 * DMA control window and a 16 MB region for no other reason,
+		 * which turned the one command you reach for when something is
+		 * already wrong into the one most likely to make it worse.
+		 *
+		 * Anything that maps the datapath can hang the CPU outright if
+		 * the PL is unprogrammed or unclocked: a Zynq-7000 AXI master
+		 * has no transaction timeout, so a read that is never answered
+		 * locks the core with no oops and no console. Diagnostics must
+		 * touch the least hardware possible. Use "dmainfo" for the
+		 * buffer details.
+		 */
 		dump();
 
 	} else if (!strcmp(cmd, "read") && argi + 1 < argc) {
@@ -497,6 +518,17 @@ int main(int argc, char **argv)
 
 	} else if (!strcmp(cmd, "clrstats")) {
 		wr(REG_CONTROL, rd(REG_CONTROL) | CTRL_CLR_STATS);
+
+	} else if (!strcmp(cmd, "dmainfo")) {
+		/* Explicitly opt in to touching the datapath. */
+		if (map_datapath() < 0) {
+			rc = 1;
+		} else {
+			printf("dma regs    0x%08lx\n", DMA_PHYS);
+			printf("dma buffer  0x%08lx (%lu KiB)\n",
+			       buf_phys, buf_size / 1024);
+			printf("S2MM_DMASR  0x%08x\n", dma_rd(S2MM_DMASR));
+		}
 
 	} else if (!strcmp(cmd, "rx") || !strcmp(cmd, "rxloop")) {
 		int loop = !strcmp(cmd, "rxloop");

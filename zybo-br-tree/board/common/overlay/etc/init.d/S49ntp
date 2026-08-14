@@ -1,0 +1,63 @@
+#!/bin/sh
+#
+# Set the clock from the local time server, then keep it there.
+#
+# Neither board has a battery-backed RTC, so every boot starts in 1980 and
+# nothing timestamped is trustworthy until this runs. Two separate jobs, which
+# is why ntpd is invoked twice:
+#
+#   ntpd -q   steps the clock once and exits. A normal NTP daemon SLEWS - it
+#             nudges the clock a few ppm at a time to avoid time ever jumping
+#             backwards. Slewing a 40-year error would take approximately
+#             forever, so the initial correction has to be a step.
+#
+#   ntpd      then runs as a daemon and slews from there, correcting the
+#             oscillator drift that would otherwise accumulate over a long
+#             capture session.
+#
+# S49 puts this after networking (S40) and after the data partition mounts
+# (S41), and before anything that logs with a timestamp.
+
+NAME=ntpd
+NTP_SERVER=10.0.0.191
+[ -r /etc/default/ntp ] && . /etc/default/ntp
+
+start() {
+	printf "Setting clock from %s: " "$NTP_SERVER"
+
+	# -q quit after setting, -n foreground, -p peer.
+	# Bounded wait: without -w ntpd can sit indefinitely if the server is
+	# unreachable, which would stall the whole boot on a board whose only
+	# job is not knowing what time it is.
+	if timeout 10 ntpd -q -n -p "$NTP_SERVER" >/dev/null 2>&1; then
+		echo "OK ($(date))"
+	else
+		echo "FAILED - clock left at $(date)"
+		echo "  check: server reachable, and NTP_SERVER in /etc/default/ntp"
+		# Deliberately not fatal. A wrong clock is worth complaining
+		# about, but it is not a reason to refuse to finish booting.
+	fi
+
+	printf "Starting %s: " "$NAME"
+	start-stop-daemon -S -q -b -x /usr/sbin/ntpd -- -n -p "$NTP_SERVER"
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+}
+
+stop() {
+	printf "Stopping %s: " "$NAME"
+	start-stop-daemon -K -q -n $NAME
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+}
+
+restart() {
+	stop
+	sleep 1
+	start
+}
+
+case "$1" in
+	start)   start ;;
+	stop)    stop ;;
+	restart|reload) restart ;;
+	*)       echo "Usage: $0 {start|stop|restart}" ; exit 1 ;;
+esac

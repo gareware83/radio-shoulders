@@ -26,6 +26,7 @@ constant C_DATA_WIDTH : natural := 32;
 --   0x24  QUAL_MIN     RO
 --   0x28  QUAL_MAX     RO
 --   0x2C  QUAL_SYMS    RO
+--   0x30  BUILD_ID     RO
 ------------------------------------------------------------------------------
 constant C_REG_ID          : natural := 0;
 constant C_REG_CONTROL     : natural := 1;
@@ -51,7 +52,21 @@ constant C_REG_QUAL_MIN    : natural := 9;
 constant C_REG_QUAL_MAX    : natural := 10;
 constant C_REG_QUAL_SYMS   : natural := 11;
 
-constant C_REG_COUNT : natural := 12;  -- number of addressable words
+-- 0x30 BUILD_ID: first 32 bits of the git commit the bitstream was built from,
+-- injected at project-creation time by create_project.tcl.
+--
+-- Answers "is the PL actually the design I think it is?", which is otherwise
+-- unanswerable from a running system - and has been the wrong assumption more
+-- than once here.
+--
+-- ALWAYS read it together with STATUS.BUILD_DIRTY. A commit hash on its own is
+-- misleading during development, because the normal working state is a tree
+-- with uncommitted changes: the hash names the last commit while the bitstream
+-- contains something else. Dirty means "this hash is a lower bound on what is
+-- in here, not an identification".
+constant C_REG_BUILD_ID    : natural := 12;
+
+constant C_REG_COUNT : natural := 13;  -- number of addressable words
 
 -- Read back at ID_VERSION to confirm which bitstream is loaded.
 -- "Zy" + version; bump the low half on register map changes.
@@ -73,6 +88,9 @@ constant C_STAT_TX_BUSY     : natural := 0;
 constant C_STAT_PLL_LOCKED  : natural := 1;
 constant C_STAT_FRAME_VALID : natural := 2;
 constant C_STAT_OVERFLOW    : natural := 3;
+-- Set when the bitstream was built from a tree with uncommitted changes, i.e.
+-- BUILD_ID does not fully identify what is in the PL.
+constant C_STAT_BUILD_DIRTY : natural := 4;
 
 -- PS -> PL: the writable registers, one entry per word offset. Read-only
 -- offsets are present but unused in this array.
