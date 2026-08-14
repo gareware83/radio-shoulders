@@ -36,9 +36,24 @@
 	};
 };
 
+/*
+ * FCLK0, the only clock in the PL.
+ *
+ * 40 MHz, and it must match CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ in
+ * vivado/create_project.tcl, which is what the timing constraint is built
+ * from. This value is the rate the hardware actually runs at - boot uses
+ * mainline U-Boot's ps7_init_gpl.c rather than an FSBL generated from the
+ * Vivado project, so nothing else reconciles the two. If they disagree, the
+ * timing report describes a board that does not exist.
+ *
+ * It was 50 MHz, where the design missed timing by 1.017 ns on 96 endpoints
+ * in the matched filter's DSP48 cascade. Nothing here needs a particular
+ * fabric clock: the DSP chain advances one sample per data_valid strobe, so
+ * the sample rate is set by how often that fires, not by this.
+ */
 &clkc {
 	assigned-clocks = <&clkc 15>;
-	assigned-clock-rates = <50000000>;	/* FCLK0, clocks the PL */
+	assigned-clock-rates = <40000000>;
 };
 
 &amba {

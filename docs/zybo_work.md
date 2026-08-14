@@ -799,7 +799,7 @@ radioctl read frames          # should increment
 radioctl read errors          # CRC failures
 ```
 
-To extend the map: add the constant in `hdl/pkg.vhd`, the `case` arm in `reg_rw_interface.vhd`, and the table entry in `package/radioctl/src/radioctl.c` — the C table is a mirror of the VHDL and has to be kept in sync by hand. Bump the low half of `C_ID_MAGIC` when the layout changes, so an old bitstream paired with a new `radioctl` is caught by the id check rather than producing confusing reads.
+To extend the map: add the constant in `hdl/pkg.vhd`, the `case` arm in `reg_rw_interface.vhd`, the table entry in `package/radioctl/src/radioctl.c`, and the enum in `package/radiomon/src/radio_regs.h` — all three userspace copies are mirrors of the VHDL and are kept in sync by hand. Bump the low half of `C_ID_MAGIC` when the layout changes, so an old bitstream paired with a new `radioctl` is caught by the id check rather than producing confusing reads.
 
 ## DSP Chain (PLL, NCO, matched filter)
 
@@ -1049,6 +1049,120 @@ Optimising frame count *directly* is the mistake — it is flat almost everywher
 - `status_reg` is still tied to zeros in `system_top.vhd`, so `frames`/`errors`/`pll_locked` read 0 regardless of what the chain does.
 - `mm2s_tready` is still tied `'1'` — with `G_VALID_SRC = VALID_DMA` the chain can't backpressure the DMA, so a stall would drop samples silently.
 
+## RX Loopback Demo — file → DDR → PL → DDR → file
+
+Plays a recorded sample file into the RX chain over MM2S and checks the frames
+that come back over S2MM against the transmitted payload. This is the first
+thing that exercises the whole datapath on real hardware rather than in
+simulation, and it needs no transmitter — the stimulus is the Python TX model's
+output.
+
+```
+ddc_input.dat --> radioctl loopback --> DDR (play region) --> MM2S --> dsp_top
+                                                                          |
+   verdict <-- rx_expected_stream.dat <-- DDR (capture region) <-- S2MM <--+
+```
+
+### Why playback is split into one transfer per frame
+
+The obvious implementation — push the whole file in one MM2S transfer —
+captures frame 1 and silently drops the rest. Three facts combine:
+
+- MM2S plays at **one sample per fabric clock** (25 ns at 40 MHz), because
+  `mm2s_tready` is tied `'1'` and `dsp_valid` is `mm2s_tvalid`.
+- `rx_frame_buffer` is a **single** store-and-forward buffer that backpressures.
+  A frame arriving while the previous one is still draining is dropped and
+  flagged in `STATUS.OVERFLOW`.
+- The inter-frame gaps are 32 symbols, about **3 µs**. Userspace cannot re-arm
+  an S2MM transfer inside that.
+
+So `waveform_generator.py` now emits `rx_chunks.txt` — one `<first sample>
+<count>` line per frame, with boundaries at the **midpoints of the idle gaps**,
+so each chunk carries its frame plus half a gap of lead-in and half of run-out.
+One frame per transfer makes overflow impossible by construction rather than by
+timing luck, and gives the truth check the same granularity as
+`rx_expected.txt`.
+
+Mapping symbol index to sample index is not `k * sps`: `lfilter` in the pulse
+shaper is causal (delays by `span/2` symbols) and `apply_timing_offset`
+resamples at a fractional phase and a ppm-scaled rate. `symbol_to_sample()`
+carries the derivation.
+
+### Buffer layout
+
+The 16 MB reserved region is split in half — low half plays, high half
+captures. One region would work only until a capture overran the samples still
+being played.
+
+### Running it
+
+```sh
+# on the host: the stimulus, the chunk list and the expected beats
+scp dsp-cake/comms_dsp/test_bench/{ddc_input.dat,rx_chunks.txt,rx_expected_stream.dat} \
+    root@10.0.0.200:/root/
+
+# on the board
+radioctl loopback ddc_input.dat \
+    --chunks rx_chunks.txt \
+    --expect rx_expected_stream.dat \
+    --out captured.bin
+```
+
+`--chunks` is optional and its absence is reported, not silently tolerated —
+without it the whole file goes out as one transfer, which is correct only for a
+single-frame stimulus. `--expect` is what makes the run mean anything: frame
+count plus CRC only proves the receiver decoded something *self-consistent*, and
+a frame carrying the wrong bytes passes CRC every time.
+
+### What it reports, and one thing it deliberately does not fail on
+
+Per chunk: bytes received, the decoded metadata word, and a beat-by-beat
+comparison. Then the register counters for the run (`frames`, `errors`,
+`syncs`, quality ratio, `OVERFLOW`).
+
+The metadata word is compared on its **low 16 bits only** — length, type,
+sequence. Bits 31:16 are the PL's running count of frames that *passed CRC*, so
+one early failure shifts it for every frame after, turning a single fault into a
+cascade of misleading failures. The drift is reported as a note instead.
+
+A run that captured everything but was never bit-checked is not called a pass.
+
+### `radiomon` — live register plotting
+
+`package/radiomon/` (C++14, `BR2_PACKAGE_RADIOMON=y`) polls the register window
+and plots the lock-quality ratio as a terminal trace, with the counters below
+it.
+
+It plots the **interval** ratio, not the raw registers. `qmin`/`qmax` are
+free-running accumulators since the last `clrstats`, so the ratio straight off
+the hardware is a cumulative average — it converges and then barely moves,
+which is exactly wrong for watching the effect of a change. The difference in
+both accumulators since the previous poll is what responds. A poll interval
+carrying no symbols holds the last value rather than drawing zero: zero reads as
+"locked badly" when the truth is "nothing arrived".
+
+The y axis is pinned to 0..1 rather than autoscaled, so the trace means the same
+thing between runs — an autoscaled axis makes a flat bad lock look identical to
+a flat good one. The 0.70 line is drawn because that is the threshold
+`radioctl` already calls a poor lock.
+
+```sh
+radiomon                       # 250 ms poll, 60x10 plot
+radiomon --interval 100 --width 100 --height 16
+```
+
+**It maps the register window only, never the DMA**, so it is safe to leave
+running while the PL's state is uncertain — same reasoning as `radioctl dump`
+versus `dmainfo`. Run it in one SSH session while `radioctl loopback` runs in
+another.
+
+The plotting library is [fbbdev/plot](https://github.com/fbbdev/plot), MIT,
+vendored as a single packed header. It needed one fix to cross-compile:
+`utils::max(1l, ...)` at three sites, where `Coord` is `std::ptrdiff_t` — `long`
+on a 64-bit host, `int` on 32-bit ARM — so template deduction fails only when
+built for the board. The header's top comment records it; reapply it if the file
+is ever re-packed.
+
 ## Boot script, rootfs updates, and build identification
 
 ### `boot.scr` is now generated by the build — and the drift it was hiding
@@ -1163,18 +1277,21 @@ Live state at the end of the last working session. Nothing here is settled.
 
 ### 0. State of the board and tree right now
 
-The board boots persistent root and responds to `radioctl` again. Three things are still out of step with the tree, and each will waste time if not handled first.
+The Vivado project **has** been regenerated from `create_project.tcl` and rebuilt to a bitstream (`vivado.log`, `launch_runs` through `write_bitstream`, copied to the repo root and `board/common/zybo_radio.bit`), and `fit.itb` was rebuilt afterwards, so the FIT carries it. That was the previous "next action" and it is done at the build level. The pinned `0x43C0_0000`, the fatal address-map check, `latest_ipdef`, the manual interconnect wiring and `build_id.vhd` generation all survived a real run.
+
+What is still out of step:
 
 | Thing | State | Consequence |
 |---|---|---|
-| Loaded bitstream | Built from a **hand-edited block design**, not regenerated from `create_project.tcl` | The pinned `0x43C0_0000`, the address-map check, `rx_quality` and `BUILD_ID` are all **untested in hardware** |
-| `radioctl` on the board | Older binary, no `build` command | `radioctl read build` returns "unknown register" — needs `radioctl-rebuild` plus a rootfs update |
-| `BUILD_ID` register | Not in the loaded bitstream | Even with a new `radioctl`, `word_index` clamps the read and returns the top implemented register — a plausible-looking wrong answer rather than an error |
-| `clk_ignore_unused` | Now in both `boot.cmd` files | Confirm the `boot.scr` on the FAT partition was regenerated; otherwise it only applies when typed by hand at the U-Boot prompt |
+| Everything above | Built, **never booted** | None of it is proven in hardware yet, only in the tool |
+| FCLK0 | Changed 50 → 40 MHz in both the tcl and the dts | Needs a Vivado rebuild *and* a Buildroot rebuild; the two must land together |
+| `BUILD_ID` in the built bitstream | `0x0e03d0a8`, which **is not a commit in this repo** | The workspace move rewrote history. `BUILD_DIRTY` is set so it was only ever a lower bound, but regenerate `build_id.vhd` before the next build or `radioctl read build` names a commit that does not exist |
+| `radioctl` / `radiomon` on the board | Rebuilt into `output-zybo/target/`, not yet onto the card | Needs an image rebuild and the rootfs update dance below |
+| `clk_ignore_unused` | In both `boot.cmd` files | Confirm the `boot.scr` on the FAT partition was regenerated; otherwise it only applies when typed by hand at the U-Boot prompt |
 
-**Next action, and it unblocks the rest:** regenerate the Vivado project from `create_project.tcl` and rebuild. That is the first exercise of the pinned address, the fatal address-map check, `latest_ipdef`, the manual interconnect wiring and `build_id.vhd` generation — all written, none proven. Then `radioctl-rebuild`, update the rootfs, and `radioctl read build` should return the commit hash.
+**Next action:** rebuild the bitstream at 40 MHz, confirm `WNS` is now positive, then rebuild the images and update the rootfs. After that the loopback demo is runnable end to end for the first time.
 
-Avoid another hand edit to the BD: it and the script have now diverged, and the script is meant to be the source of truth.
+Avoid another hand edit to the BD: the script is the source of truth and has now proven it can rebuild the design.
 
 ### 1. `ddc_input.dat` is currently a ZERO-IMPAIRMENT bisect stimulus
 
@@ -1229,15 +1346,33 @@ Note the other four IP lookups still use `[lindex ... 0]`. They work because tho
 
 **Scatter-Gather is off on purpose** — see the long comment in `create_project.tcl`. With SG on, the Simple-mode registers (`S2MM_DA`/`S2MM_LENGTH`) do not exist at all and every transfer needs descriptor chains in memory. Reverting to SG=1 permanently means rewriting the userspace DMA path around descriptors.
 
-### 4. Timing is not met — still open
+### 4. Timing — the constraint was never wrong, and FCLK0 is now 40 MHz
 
 `WNS = -1.017 ns`, `TNS = -87.5 ns`, **96 failing endpoints**, all on `clk_fpga_0` and all in `uut/inst_filter` — the matched filter's DSP48 cascade (`q_shift_reg_reg[8][15]` → `q_out0__5/PCIN[*]`). Nothing in the AXI path fails, which is why the register hang turned out to be the address map rather than timing.
 
-Vivado emits a bitstream anyway; timing failure is only a critical warning.
+**Correcting what this section used to say.** It claimed the design was constrained at 100 MHz while the devicetree ran FCLK0 at 50, and therefore had twice the slack the report showed. That was wrong, and it was wrong in the direction that invites ignoring a real violation. The Clock Summary in `system_top_timing_summary_routed.rpt` reads:
 
-Complication worth resolving before tuning anything: **the devicetree runs FCLK0 at 50 MHz** (`assigned-clock-rates = <50000000>`) while the design appears to be constrained at 100 MHz. If that is right, the hardware has twice the slack the report describes and these paths are fine in practice — but the constraint and the real clock disagreeing means the report cannot be trusted either way. Fix the constraint to match reality first, then judge.
+```
+Clock       Waveform(ns)       Period(ns)      Frequency(MHz)
+clk_fpga_0  {0.000 10.000}     20.000          50.000
+```
 
-If it is genuinely tight at the real clock rate, the fix is a pipeline register in the matched filter accumulator — the 9-tap sum currently resolves in one cycle.
+20 ns — the constraint always matched the devicetree. There was nothing to reconcile, and `-1.017 ns` was a genuine failure at the clock the board actually ran. Check the number before theorising about it: `get_property PERIOD [get_clocks clk_fpga_0]` on the implemented design answers this in one line.
+
+**Why place-and-route cannot fix it.** The failing path is 19.27 ns of which **16.4 ns (85%) is logic**, across 13 levels: seven chained DSP48E1s in a PCOUT→PCIN cascade plus a CARRY4 chain and a LUT2. Five of those cascade hops are 1.713 ns each and are fixed silicon. Implementation strategies and post-route `phys_opt` work on the 2.86 ns of routing, so the entire budget they can address is smaller than the miss. Retiming has only the one output register to move and cannot cover seven cascade stages. This is where a day disappears for no gain.
+
+**Root cause, and the proper fix.** `matched_filter_rrc.vhd` computes nine multiplies and the whole adder tree between two flops, so none of the DSP48's internal A/M/P registers get used. The real fix is to register the products and split the adder tree — contained, but it changes chain latency, and `dsp_top` compensates for the PLL's missing `valid_out` with a hand-counted delay that has to move with it. That wants a simulation behind it, so it is a separate change.
+
+**What was done instead: FCLK0 50 → 40 MHz.** 25 ns closes every failing endpoint with roughly 4 ns spare, with no RTL change and no latency shift. It costs nothing real — the DSP chain advances one sample per `data_valid`, so the fabric clock sets no sample rate, and nothing at these frame sizes needs the AXI bandwidth. Two places, and **they must agree**:
+
+| Where | Setting | What it controls |
+|---|---|---|
+| `vivado/create_project.tcl` | `CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {40}` on the PS7 | The timing constraint, and nothing else |
+| `board/common/zynq-zybo-z7-radio.dts` | `assigned-clock-rates = <40000000>` | The rate the hardware actually runs at |
+
+They are independent because boot uses mainline U-Boot's bundled `ps7_init_gpl.c` rather than an FSBL generated from the Vivado project — nothing reconciles the two automatically. If they drift apart, the timing report stops describing the board, which is the situation this section previously mis-diagnosed.
+
+Vivado emits a bitstream even when timing fails; it is only a critical warning. Confirm `WNS` is positive on the next rebuild rather than assuming the clock change took.
 
 ### 5. Repo split
 
@@ -1274,7 +1409,9 @@ Watch the output trees: they are named `output/`, `output-zybo/` and `output-pyn
 - [x] `BUILD_ID` + `STATUS.BUILD_DIRTY` so a running board reports which commit its bitstream came from
 - [x] NTP (busybox `ntpd`) against the dev host on both boards — no RTC on either
 - [x] **`clk_ignore_unused` in bootargs** — without it FCLK0 is gated off after boot, the PL runs unclocked, and any register access hard-locks the CPU
-- [ ] **Timing not met**: WNS −1.017 ns, 96 endpoints, all in the matched filter's DSP cascade. Resolve the 50 vs 100 MHz constraint mismatch before tuning
+- [~] **Timing**: was WNS −1.017 ns on 96 endpoints in the matched filter's DSP cascade, at a constraint that turned out to be correct all along (50 MHz, matching the dts). FCLK0 dropped to 40 MHz in both the tcl and the dts; **rebuild and confirm WNS is positive**. Pipelining the filter MAC is the proper fix and is still open
+- [x] **RX loopback demo**: `radioctl loopback` plays a sample file through DDR → MM2S → RX chain → S2MM → DDR and checks every beat against the transmitted payload. One transfer per frame, boundaries from `rx_chunks.txt`, because the single frame buffer backpressures and a 3 µs gap is not re-armable from userspace. Built and host-tested; **not yet run on hardware**
+- [x] `radiomon` — live terminal plot of the lock-quality ratio + counters, register window only. Cross-compiles for the board (needed one 32-bit fix in the vendored plot library)
 - [ ] CI joining the Vivado and Buildroot builds (bitstream → `board/common/` → FIT is currently a manual step)
 - [x] **PL/PS plumbing live on hardware** — AXI DMA probes at `0x8040_0000`, `/dev/uio0` maps the register window at `0x43C0_0000`, FPGA manager present at `/sys/class/fpga_manager/fpga0`
 - [x] Register control path end-to-end, **verified on hardware** — rebuilt `reg_rw_interface` (real address decode, RO/RW split, pulse bits) + `radioctl` in the rootfs. `id` reads `0x5A790001`, RW registers round-trip (`mode`, `tx_len`), `tx_start` self-clears after `transmit`.

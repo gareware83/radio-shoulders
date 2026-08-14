@@ -428,6 +428,75 @@ class RRCWaveformGenerator:
         print(f"[✓] Wrote {len(lines)} expected stream beats to {filename}")
         return lines
 
+    def symbol_to_sample(self, k, timing_offset=0.0, ppm=0.0):
+        """Output-sample index at which symbol k lands in ddc_input.dat.
+
+        Two things move a symbol away from the naive k*sps:
+
+          - lfilter() in upsample_and_filter() is causal, so pulse shaping
+            delays everything by half the filter, span/2 symbols.
+          - apply_timing_offset() resamples starting at a fractional phase and
+            at a slightly wrong rate, so the mapping is offset AND scaled.
+
+        From apply_timing_offset(), output sample n reads high-rate index
+        offset*hi_sps + n*osr*(1+ppm*1e-6), and symbol k peaks at high-rate
+        index k*hi_sps + span*hi_sps/2. Equating the two and cancelling osr:
+
+            n = (k + span/2 - offset) * sps / (1 + ppm*1e-6)
+        """
+        return (k + self.span / 2.0 - timing_offset) * self.sps / (1.0 + ppm * 1e-6)
+
+    def save_chunks(self, manifest, n_samples, gap_symbols=32, timing_offset=0.0,
+                    ppm=0.0, filename="rx_chunks.txt"):
+        """Sample ranges holding exactly one frame each, for PS-side playback.
+
+        The hardware reason this file exists: rx_frame_buffer is a SINGLE
+        store-and-forward buffer, and it backpressures rather than streaming -
+        a frame arriving while the previous one is still draining is dropped
+        and flagged in STATUS.OVERFLOW. MM2S plays at one sample per fabric
+        clock (25 ns), so the 32-symbol inter-frame gap is about 3 us, and
+        userspace cannot re-arm an S2MM transfer inside that. Pushing the
+        whole file as one transfer therefore captures frame 1 and silently
+        drops the rest.
+
+        Splitting playback into one transfer per frame makes overflow
+        impossible by construction rather than by timing luck, and gives the
+        truth check the same granularity as rx_expected.txt.
+
+        Boundaries are the MIDPOINTS of the idle gaps: each chunk carries its
+        frame plus half a gap of lead-in (so the loops see silence before the
+        preamble, as they would on a real re-acquisition) and half a gap of
+        run-out (so the last symbols flush through the filter and framer
+        before the transfer ends).
+
+        One line per frame: <first sample> <count>
+        """
+        half_gap = gap_symbols / 2.0
+        rows = []
+
+        for i, m in enumerate(manifest):
+            first_sym = m["start_symbol"] - (half_gap if i else self.span)
+            last_sym = m["start_symbol"] + m["n_symbols"] + half_gap
+
+            start = int(np.floor(self.symbol_to_sample(first_sym, timing_offset, ppm)))
+            end = int(np.ceil(self.symbol_to_sample(last_sym, timing_offset, ppm)))
+
+            start = max(0, start)
+            end = min(n_samples, end)
+            if end <= start:
+                raise SystemExit(f"[!] frame {i + 1} maps to an empty sample range "
+                                 f"({start}..{end}) - check sps/span/ppm")
+            rows.append((start, end - start))
+
+        with open(filename, "w") as f:
+            f.write("# One playback chunk per frame: <first sample> <count>\n")
+            f.write("# Indices into ddc_input.dat. Boundaries sit mid-gap so each\n")
+            f.write("# chunk holds exactly one frame - see save_chunks() for why.\n")
+            for start, count in rows:
+                f.write(f"{start} {count}\n")
+        print(f"[✓] Wrote {len(rows)} playback chunks to {filename}")
+        return rows
+
     # =================================================================
     # Entry points
     # =================================================================
@@ -499,6 +568,8 @@ class RRCWaveformGenerator:
         self.save_symbols_to_file(symbols, "qpsk_symbols.dat")
         self.save_manifest(manifest, "rx_expected.txt")
         self.save_expected_stream(manifest, "rx_expected_stream.dat")
+        self.save_chunks(manifest, len(quantized), gap_symbols=gap_symbols,
+                         timing_offset=timing_offset, ppm=ppm)
 
         taps = self.rrc_taps_quantized(sps=self.sps // 2)
         self.check_filter_scaling(quantized, taps)

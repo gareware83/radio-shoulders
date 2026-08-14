@@ -76,7 +76,17 @@ enum {
 /*
  * AXI DMA register offsets, Simple mode (SG is disabled in the IP - see the
  * note in vivado/create_project.tcl). Byte offsets from the DMA base.
+ *
+ * MM2S is DDR -> PL, the stimulus playback direction used by "loopback".
+ * Note the soft reset in either DMACR resets the WHOLE engine, both channels,
+ * so it can only be used between passes and never to re-arm one direction
+ * while the other is mid-transfer.
  */
+#define MM2S_DMACR   0x00
+#define MM2S_DMASR   0x04
+#define MM2S_SA      0x18
+#define MM2S_LENGTH  0x28
+
 #define S2MM_DMACR   0x30
 #define S2MM_DMASR   0x34
 #define S2MM_DA      0x48
@@ -247,25 +257,23 @@ static long now_ms(void)
 }
 
 /*
- * Arms one S2MM transfer and waits for it. Returns bytes received, or -1.
- *
- * Simple mode: destination address, then length, and writing the length is
- * what starts the transfer. The PL terminates it early with TLAST at the end
- * of a frame, and S2MM_LENGTH then reads back the actual byte count.
+ * Arms an S2MM transfer. Simple mode: destination address, then length, and
+ * writing the length is what starts it. The PL terminates the transfer early
+ * with TLAST at the end of a frame, and S2MM_LENGTH then reads back the
+ * actual byte count.
  */
-static long rx_one(int timeout_ms)
+static void s2mm_arm(unsigned long dst_phys, uint32_t capacity)
 {
-	if (dma_reset() < 0)
-		return -1;
-
-	dma_wr(S2MM_DA, (uint32_t)buf_phys);
+	dma_wr(S2MM_DA, (uint32_t)dst_phys);
 	dma_wr(S2MM_DMACR, DMACR_RS);
+	dma_wr(S2MM_LENGTH, capacity);
+}
 
-	/* Cap at the buffer size; a frame is far smaller and TLAST ends it. */
-	uint32_t want = buf_size > 0x400000 ? 0x400000 : (uint32_t)buf_size;
-	dma_wr(S2MM_LENGTH, want);
-
+/* Waits for the armed S2MM transfer. Bytes received, -1 error, -2 timeout. */
+static long s2mm_wait(int timeout_ms)
+{
 	long deadline = now_ms() + timeout_ms;
+
 	for (;;) {
 		uint32_t sr = dma_rd(S2MM_DMASR);
 
@@ -287,6 +295,18 @@ static long rx_one(int timeout_ms)
 
 		usleep(1000);
 	}
+}
+
+static long rx_one(int timeout_ms)
+{
+	if (dma_reset() < 0)
+		return -1;
+
+	/* Cap at the buffer size; a frame is far smaller and TLAST ends it. */
+	uint32_t want = buf_size > 0x400000 ? 0x400000 : (uint32_t)buf_size;
+	s2mm_arm(buf_phys, want);
+
+	return s2mm_wait(timeout_ms);
 }
 
 static void hexdump(const volatile uint8_t *p, unsigned len)
@@ -333,6 +353,453 @@ static int show_frame(long got)
 	if (len)
 		hexdump(buf + 4, len);
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Loopback: play a stimulus file into the RX chain and check what      */
+/* comes back                                                           */
+/*                                                                      */
+/* The reserved buffer is split in half: the low half holds the sample   */
+/* stream MM2S plays out, the high half receives the frames S2MM writes  */
+/* back. One region would work only until a capture overran into the     */
+/* samples still being played.                                           */
+/* ------------------------------------------------------------------ */
+
+#define TX_REGION_OFF 0UL
+#define RX_REGION_OFF (buf_size / 2)
+
+static int map_datapath(void);
+
+struct chunk {
+	unsigned long first;   /* first sample index */
+	unsigned long count;   /* samples */
+};
+
+struct beat {
+	uint32_t data;
+	unsigned keep;
+	int      last;
+};
+
+/*
+ * Loads a ddc_input.dat-style file - one decimal sample per line - into the
+ * playback half of the buffer, one 32-bit word per sample.
+ *
+ * The PL takes mm2s_tdata(15 downto 0) as a signed sample and ignores the
+ * upper half (system_top.vhd), so only the low 16 bits carry meaning; the
+ * value is written sign-extended purely so a hexdump of the buffer reads the
+ * way the file does. Anything outside int16 is a generator bug that would
+ * otherwise truncate silently, so it is reported rather than masked.
+ */
+static long load_stimulus(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+
+	volatile uint32_t *w = (volatile uint32_t *)(buf + TX_REGION_OFF);
+	unsigned long cap = (buf_size / 2) / 4;
+	unsigned long n = 0;
+	int clipped = 0;
+	char line[64];
+
+	while (fgets(line, sizeof(line), f)) {
+		char *end;
+		long v = strtol(line, &end, 10);
+
+		if (end == line)
+			continue;   /* blank line or comment */
+
+		if (n >= cap) {
+			fprintf(stderr, "%s: more than %lu samples, does not fit "
+					"the playback region\n", path, cap);
+			fclose(f);
+			return -1;
+		}
+		if (v > 32767 || v < -32768)
+			clipped++;
+
+		w[n++] = (uint32_t)(int32_t)v;
+	}
+	fclose(f);
+
+	if (clipped)
+		fprintf(stderr, "warning: %d sample(s) outside 16-bit range - the PL "
+				"sees only bits 15:0\n", clipped);
+	if (!n) {
+		fprintf(stderr, "%s: no samples read\n", path);
+		return -1;
+	}
+	return (long)n;
+}
+
+/*
+ * Loads the playback chunk list written by waveform_generator.py's
+ * save_chunks(): "<first sample> <count>", one line per frame.
+ *
+ * Without it the whole stimulus goes out as one transfer, which captures the
+ * first frame and drops the rest - rx_frame_buffer holds a single frame and
+ * backpressures, and userspace cannot re-arm S2MM inside a 3 us inter-frame
+ * gap. One transfer per frame makes that structurally impossible instead of
+ * relying on timing.
+ */
+static int load_chunks(const char *path, struct chunk **out, unsigned long n_samples)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+
+	int cap = 16, n = 0;
+	struct chunk *c = malloc(cap * sizeof(*c));
+	char line[128];
+
+	while (c && fgets(line, sizeof(line), f)) {
+		unsigned long first, count;
+
+		if (line[0] == '#')
+			continue;
+		if (sscanf(line, "%lu %lu", &first, &count) != 2)
+			continue;
+
+		if (first + count > n_samples) {
+			fprintf(stderr, "chunk %d (%lu+%lu) runs past the %lu samples "
+					"loaded - stimulus and chunk file disagree\n",
+				n + 1, first, count, n_samples);
+			free(c);
+			fclose(f);
+			return -1;
+		}
+		if (n == cap) {
+			cap *= 2;
+			struct chunk *bigger = realloc(c, cap * sizeof(*c));
+			if (!bigger) { free(c); c = NULL; break; }
+			c = bigger;
+		}
+		c[n].first = first;
+		c[n].count = count;
+		n++;
+	}
+	fclose(f);
+
+	if (!c) {
+		fprintf(stderr, "out of memory reading %s\n", path);
+		return -1;
+	}
+	if (!n) {
+		fprintf(stderr, "%s: no chunks found\n", path);
+		free(c);
+		return -1;
+	}
+	*out = c;
+	return n;
+}
+
+/*
+ * Loads rx_expected_stream.dat: the exact AXI-Stream beats rx_frame_buffer
+ * should emit, "<data hex8> <keep hex1> <last 0|1>" per line. Frames are
+ * delimited by last=1.
+ *
+ * This is the check that means anything. Frame count plus CRC only proves the
+ * receiver decoded something self-consistent - a frame carrying the wrong
+ * bytes passes CRC every time.
+ */
+static int load_expected(const char *path, struct beat **out)
+{
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+
+	int cap = 64, n = 0;
+	struct beat *b = malloc(cap * sizeof(*b));
+	char line[128];
+
+	while (b && fgets(line, sizeof(line), f)) {
+		unsigned data, keep, last;
+
+		if (line[0] == '#')
+			continue;
+		if (sscanf(line, "%x %x %u", &data, &keep, &last) != 3)
+			continue;
+
+		if (n == cap) {
+			cap *= 2;
+			struct beat *bigger = realloc(b, cap * sizeof(*b));
+			if (!bigger) { free(b); b = NULL; break; }
+			b = bigger;
+		}
+		b[n].data = data;
+		b[n].keep = keep;
+		b[n].last = last != 0;
+		n++;
+	}
+	fclose(f);
+
+	if (!b) {
+		fprintf(stderr, "out of memory reading %s\n", path);
+		return -1;
+	}
+	*out = b;
+	return n;
+}
+
+static unsigned keep_bytes(unsigned keep)
+{
+	unsigned n = 0;
+	for (unsigned i = 0; i < 4; i++)
+		if (keep & (1u << i))
+			n++;
+	return n;
+}
+
+/*
+ * Compares one captured frame against its expected beats. Returns 0 on a
+ * match.
+ *
+ * The metadata word is compared on its low 16 bits only - length, type and
+ * sequence. Bits 31:16 are the PL's running frame counter, which tracks
+ * frames that PASSED CRC; one earlier frame failing shifts it for every frame
+ * after, turning one fault into a cascade of misleading failures. It is
+ * reported instead.
+ */
+static int check_frame(const volatile uint8_t *p, long got,
+		       const struct beat *b, int nb, int frame_no)
+{
+	unsigned exact = 4 * (nb - 1) + keep_bytes(b[nb - 1].keep);
+	unsigned padded = 4 * nb;
+	int bad = 0;
+
+	/* Whether the DMA writes a partial final beat as its kept bytes or pads
+	 * to a whole word is a property of the IP rather than of this design, so
+	 * both are accepted. They are identical whenever the payload is a
+	 * multiple of 4 bytes, which is the case for every frame the generator
+	 * currently emits. */
+	if ((unsigned)got != exact && (unsigned)got != padded) {
+		printf("    byte count %ld, expected %u\n", got, exact);
+		bad++;
+	}
+
+	for (int i = 0; i < nb; i++) {
+		if ((long)(4 * i + 4) > got) {
+			printf("    beat %d missing (transfer ended early)\n", i);
+			bad++;
+			break;
+		}
+
+		uint32_t v = *(volatile uint32_t *)(p + 4 * i);
+		uint32_t want = b[i].data;
+		uint32_t mask = 0;
+
+		for (unsigned k = 0; k < 4; k++)
+			if (b[i].keep & (1u << k))
+				mask |= 0xffu << (8 * k);
+
+		if (i == 0) {
+			if ((v & 0xffffu) != (want & 0xffffu)) {
+				printf("    meta: len/type/seq 0x%04x, expected 0x%04x\n",
+				       v & 0xffffu, want & 0xffffu);
+				bad++;
+			}
+			if ((v >> 16) != (want >> 16))
+				printf("    note: PL frame counter %u, expected %u "
+				       "(an earlier frame failed CRC)\n",
+				       v >> 16, want >> 16);
+			continue;
+		}
+
+		if ((v & mask) != (want & mask)) {
+			printf("    beat %d: 0x%08x, expected 0x%08x\n", i, v, want);
+			bad++;
+		}
+	}
+
+	if (!bad)
+		printf("    frame %d OK\n", frame_no);
+	return bad;
+}
+
+static void mm2s_play(unsigned long src_phys, uint32_t bytes)
+{
+	dma_wr(MM2S_SA, (uint32_t)src_phys);
+	dma_wr(MM2S_DMACR, DMACR_RS);
+	dma_wr(MM2S_LENGTH, bytes);   /* writing the length starts it */
+}
+
+static int cmd_loopback(const char *stim, const char *chunkf, const char *expectf,
+			const char *outf, int timeout_ms)
+{
+	struct chunk *chunks = NULL, one;
+	struct beat *beats = NULL;
+	int n_chunks, n_beats = 0;
+	FILE *out = NULL;
+	int rc = 0;
+
+	if (map_datapath() < 0)
+		return 1;
+
+	long n_samples = load_stimulus(stim);
+	if (n_samples < 0)
+		return 1;
+	printf("stimulus    %ld samples from %s\n", n_samples, stim);
+
+	if (chunkf) {
+		n_chunks = load_chunks(chunkf, &chunks, (unsigned long)n_samples);
+		if (n_chunks < 0)
+			return 1;
+		printf("chunks      %d, from %s\n", n_chunks, chunkf);
+	} else {
+		/* Everything in one transfer. Legitimate for a single-frame
+		 * stimulus and useless for a multi-frame one, so say so. */
+		one.first = 0;
+		one.count = (unsigned long)n_samples;
+		chunks = &one;
+		n_chunks = 1;
+		printf("chunks      none given - playing the whole file as one "
+		       "transfer\n            (only the first frame can be "
+		       "captured; see --chunks)\n");
+	}
+
+	if (expectf) {
+		n_beats = load_expected(expectf, &beats);
+		if (n_beats < 0) {
+			rc = 1;
+			goto done;
+		}
+		printf("expected    %d stream beats from %s\n", n_beats, expectf);
+	}
+
+	if (outf) {
+		out = fopen(outf, "wb");
+		if (!out) {
+			fprintf(stderr, "open %s: %s\n", outf, strerror(errno));
+			rc = 1;
+			goto done;
+		}
+	}
+
+	unsigned long tx_phys = buf_phys + TX_REGION_OFF;
+	unsigned long rx_phys = buf_phys + RX_REGION_OFF;
+	uint32_t rx_cap = (buf_size / 2) > 0x100000 ? 0x100000
+						    : (uint32_t)(buf_size / 2);
+
+	printf("buffer      play 0x%08lx, capture 0x%08lx\n", tx_phys, rx_phys);
+
+	/* Counters describe this run only. */
+	wr(REG_CONTROL, rd(REG_CONTROL) | CTRL_CLR_STATS);
+
+	/* Arm the receiver before any DMA: a frame landing between the two is
+	 * dropped and flagged as an overflow rather than captured. */
+	wr(REG_CONTROL, rd(REG_CONTROL) | CTRL_ENABLE | CTRL_RX_ENABLE);
+
+	if (dma_reset() < 0) {
+		rc = 1;
+		goto done;
+	}
+
+	int beat_i = 0, captured = 0, failed = 0, missed = 0;
+
+	for (int c = 0; c < n_chunks; c++) {
+		printf("\nchunk %d: samples %lu..%lu\n", c + 1, chunks[c].first,
+		       chunks[c].first + chunks[c].count - 1);
+
+		/* Capture first, then play - the other order races the frame. */
+		s2mm_arm(rx_phys, rx_cap);
+		mm2s_play(tx_phys + chunks[c].first * 4,
+			  (uint32_t)(chunks[c].count * 4));
+
+		long got = s2mm_wait(timeout_ms);
+
+		if (got == -2) {
+			printf("    no frame within %d ms\n", timeout_ms);
+			missed++;
+			/* The transfer is still outstanding; it has to be
+			 * cleared before the next chunk can arm one. Reset is
+			 * global, so the idle MM2S goes with it - harmless
+			 * here, since its transfer has already drained. */
+			if (dma_reset() < 0) {
+				rc = 1;
+				break;
+			}
+		} else if (got < 0) {
+			rc = 1;
+			break;
+		} else {
+			captured++;
+
+			uint32_t mm_sr = dma_rd(MM2S_DMASR);
+			if (mm_sr & DMASR_ERRORS)
+				printf("    warning: MM2S_DMASR=0x%08x (playback "
+				       "error)\n", mm_sr);
+
+			const volatile uint8_t *p = buf + RX_REGION_OFF;
+			uint32_t meta = *(volatile uint32_t *)p;
+
+			printf("    got %ld bytes: len=%u type=0x%x seq=%u "
+			       "(PL frame %u)\n", got, META_LEN(meta),
+			       META_TYPE(meta), META_SEQ(meta), META_COUNT(meta));
+
+			if (out && fwrite((const void *)p, 1, (size_t)got, out) != (size_t)got) {
+				fprintf(stderr, "write %s: %s\n", outf, strerror(errno));
+				rc = 1;
+				break;
+			}
+
+			if (beats) {
+				/* Walk to the end of this frame's beats. */
+				int start = beat_i;
+				while (beat_i < n_beats && !beats[beat_i].last)
+					beat_i++;
+				if (beat_i < n_beats)
+					beat_i++;   /* include the last beat */
+
+				int nb = beat_i - start;
+				if (nb <= 0)
+					printf("    no expected frame left to "
+					       "compare against\n");
+				else if (check_frame(p, got, &beats[start], nb, c + 1))
+					failed++;
+			}
+		}
+	}
+
+	uint32_t qmin = rd(REG_QUAL_MIN), qmax = rd(REG_QUAL_MAX);
+	uint32_t st = rd(REG_STATUS);
+
+	printf("\n--- result ---\n");
+	printf("captured    %d of %d chunks", captured, n_chunks);
+	if (missed)
+		printf(", %d timed out", missed);
+	printf("\n");
+	if (beats)
+		printf("bit-truth   %d frame(s) mismatched\n", failed);
+	printf("frames      %u passed CRC\n", rd(REG_FRAME_COUNT));
+	printf("errors      %u failed CRC\n", rd(REG_ERR_COUNT));
+	printf("syncs       %u sync-word detections\n", rd(REG_SYNC_COUNT));
+	if (qmax)
+		printf("quality     %.3f over %u symbols%s\n",
+		       (double)qmin / (double)qmax, rd(REG_QUAL_SYMS),
+		       ((double)qmin / (double)qmax) < 0.70 ? "  (POOR LOCK)" : "");
+	if (st & STAT_OVERFLOW)
+		printf("overflow    set - a frame was dropped while the buffer "
+		       "was draining\n");
+
+	/* A run that captured everything but was never bit-checked has not
+	 * proved anything about content, so it is not called a pass. */
+	if (rc == 0 && (missed || failed || captured != n_chunks))
+		rc = 1;
+
+done:
+	if (out)
+		fclose(out);
+	if (chunks != &one)
+		free(chunks);
+	free(beats);
+	return rc;
 }
 
 static void dump(void)
@@ -391,6 +858,16 @@ static void usage(const char *p)
 		"  rx [timeout_ms]       arm the DMA, wait for one frame, print it\n"
 		"                        (default timeout 5000 ms)\n"
 		"  rxloop [timeout_ms]   same, repeating until interrupted\n"
+		"\n"
+		"  loopback <samples.dat> [options]\n"
+		"                        play a sample file through the RX chain and\n"
+		"                        check the frames that come back\n"
+		"    --chunks <file>     one playback transfer per frame\n"
+		"                        (rx_chunks.txt; without it only the first\n"
+		"                         frame of a multi-frame file is captured)\n"
+		"    --expect <file>     rx_expected_stream.dat, for the bit-truth check\n"
+		"    --out <file>        write captured frames here, metadata included\n"
+		"    --timeout <ms>      per-frame capture timeout (default 2000)\n"
 		"\n"
 		"registers: ", p);
 	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
@@ -529,6 +1006,32 @@ int main(int argc, char **argv)
 			       buf_phys, buf_size / 1024);
 			printf("S2MM_DMASR  0x%08x\n", dma_rd(S2MM_DMASR));
 		}
+
+	} else if (!strcmp(cmd, "loopback") && argi + 1 < argc) {
+		const char *stim = argv[argi + 1];
+		const char *chunkf = NULL, *expectf = NULL, *outf = NULL;
+		int timeout = 2000;
+
+		for (int a = argi + 2; a < argc; a++) {
+			int has_val = a + 1 < argc;
+
+			if (!strcmp(argv[a], "--chunks") && has_val)
+				chunkf = argv[++a];
+			else if (!strcmp(argv[a], "--expect") && has_val)
+				expectf = argv[++a];
+			else if (!strcmp(argv[a], "--out") && has_val)
+				outf = argv[++a];
+			else if (!strcmp(argv[a], "--timeout") && has_val)
+				timeout = atoi(argv[++a]);
+			else {
+				fprintf(stderr, "unknown or incomplete option: %s\n",
+					argv[a]);
+				usage(argv[0]);
+				return 1;
+			}
+		}
+
+		rc = cmd_loopback(stim, chunkf, expectf, outf, timeout);
 
 	} else if (!strcmp(cmd, "rx") || !strcmp(cmd, "rxloop")) {
 		int loop = !strcmp(cmd, "rxloop");

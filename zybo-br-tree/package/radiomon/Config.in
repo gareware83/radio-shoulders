@@ -1,0 +1,16 @@
+config BR2_PACKAGE_RADIOMON
+	bool "radiomon"
+	depends on BR2_INSTALL_LIBSTDCPP
+	help
+	  Live terminal monitor for the comms DSP receiver. Polls the PL
+	  register window and plots the lock-quality ratio (qmin/qmax)
+	  as it moves, alongside the frame, error and sync counters.
+
+	  Reads the register window only - it never maps the DMA, so it
+	  is safe to leave running while the PL's state is uncertain.
+
+	  Requires the generic-uio devicetree node and
+	  uio_pdrv_genirq.of_id=generic-uio on the kernel command line.
+
+comment "radiomon needs a toolchain w/ C++"
+	depends on !BR2_INSTALL_LIBSTDCPP

@@ -103,9 +103,16 @@ Green = simulated. Amber = built but unsimulated.
 
 All sample-path signals are **16-bit signed**. The chain is **sample-rate
 agnostic**: it advances one sample per `data_valid` strobe regardless of the
-100 MHz system clock, so no clock-domain conversion is needed anywhere — only
-the right strobe. `G_VALID_SRC` selects where that strobe comes from
-(`VALID_DMA`, `VALID_ADC`, or `VALID_ALWAYS` for simulation).
+fabric clock, so no clock-domain conversion is needed anywhere — only the right
+strobe. `G_VALID_SRC` selects where that strobe comes from (`VALID_DMA`,
+`VALID_ADC`, or `VALID_ALWAYS` for simulation).
+
+That is also why the fabric clock is a free parameter rather than a system
+requirement: FCLK0 is **40 MHz**, chosen to close timing on the matched
+filter's DSP cascade, and no part of the chain's behaviour depends on it. It is
+set in two places that must agree — `PCW_FPGA0_PERIPHERAL_FREQMHZ` in
+`create_project.tcl` (the timing constraint) and `assigned-clock-rates` in the
+devicetree (the actual rate).
 
 ### 2.3 Design decisions worth knowing
 
@@ -448,12 +455,16 @@ radioctl <command>
   dmainfo               DMA buffer location and status (maps the DMA)
   rx [timeout_ms]       arm the DMA, wait for one frame, print it
   rxloop [timeout_ms]   same, repeating until interrupted
+
+  loopback <samples.dat> [--chunks f] [--expect f] [--out f] [--timeout ms]
+                        play a sample file through the RX chain and check
+                        the frames that come back
 ```
 
-`dump` and `read` touch only the register window. `dmainfo`, `rx` and `rxloop`
-additionally map the DMA control window — stay on the first two whenever the
-PL's state is uncertain, since an unclocked or unprogrammed PL hard-locks the
-CPU on any access it cannot answer.
+`dump` and `read` touch only the register window. `dmainfo`, `rx`, `rxloop` and
+`loopback` additionally map the DMA control window — stay on the first two
+whenever the PL's state is uncertain, since an unclocked or unprogrammed PL
+hard-locks the CPU on any access it cannot answer.
 
 #### Registers and access
 
@@ -530,7 +541,48 @@ format's 8-bit length field.
 `clrstats` resets `frames`, `errors`, `syncs` and the quality accumulators.
 `id` and `build` are constants in fabric and are unaffected.
 
-### 5.3 RX receive sequence
+### 5.3 Loopback: replaying a sample file through the receiver
+
+`radioctl loopback` drives both DMA directions at once — MM2S plays a recorded
+sample file out of DDR into the chain, S2MM captures the frames that come back
+— and compares every captured beat against `rx_expected_stream.dat`. It is the
+hardware equivalent of the RTL testbench's bit-truth check, and needs no
+transmitter.
+
+The reserved 16 MB is split: low half plays, high half captures.
+
+**Playback is one transfer per frame, not one per file.** `rx_frame_buffer`
+holds a single frame and backpressures, so a frame arriving while the previous
+one is still draining is dropped as `OVERFLOW`. MM2S plays one sample per
+fabric clock (25 ns), making the 32-symbol inter-frame gap about 3 µs — far
+too short to re-arm an S2MM transfer from userspace. `waveform_generator.py`
+therefore emits `rx_chunks.txt`, one sample range per frame with boundaries at
+the midpoints of the idle gaps, which makes overflow structurally impossible
+instead of a race.
+
+Per chunk the sequence is: arm S2MM, start MM2S, wait, compare. Capture is
+armed **before** playback for the same reason the receiver is armed before the
+DMA in the sequence below.
+
+The metadata word is checked on its low 16 bits only. Bits 31:16 are the count
+of frames that passed CRC, so one early failure shifts it for every frame
+after — comparing it strictly would turn a single fault into a cascade of
+misleading failures, so the drift is reported rather than failed.
+
+### 5.4 `radiomon`
+
+Live terminal plot of the lock-quality ratio, with the frame, error and sync
+counters beneath it. Buildroot package at `zybo-br-tree/package/radiomon/`.
+
+It plots the **interval** ratio rather than the registers directly: `qmin` and
+`qmax` are free-running accumulators, so their raw ratio is a cumulative
+average that converges and then stops responding — useless for watching the
+effect of an adjustment. The difference since the previous poll is what moves.
+
+It maps the register window only and never the DMA, so unlike `radioctl rx` it
+is safe to leave running when the PL's state is uncertain.
+
+### 5.5 RX receive sequence
 
 ```mermaid
 sequenceDiagram
@@ -571,7 +623,7 @@ transfer**, so the destination address and `RS` must both be set first.
 PL terminates the transfer early with `TLAST` at the end of a frame rather than
 filling the requested capacity.
 
-### 5.4 AXI DMA registers used
+### 5.6 AXI DMA registers used
 
 Simple mode only — SG is disabled in the IP, so descriptor registers do not
 exist. Byte offsets from `0x8040_0000`.
@@ -586,7 +638,7 @@ exist. Byte offsets from `0x8040_0000`.
 Simple mode caps one transfer at 2²⁶−1 bytes — far more than a frame, or than
 any stimulus buffer pushed the other way.
 
-### 5.5 Software gaps
+### 5.7 Software gaps
 
 - **Polling, not interrupts.** `radioctl` polls `DMASR.IOC_Irq` with a 1 ms
   sleep. The devicetree already routes the S2MM interrupt to the DMA's UIO node,
@@ -594,7 +646,11 @@ any stimulus buffer pushed the other way.
   step; it needs the standard re-enable write after each interrupt.
 - No transport layer. Nothing yet carries frames between the two boards over
   Ethernet.
-- No TX-side software, because there is no TX chain.
+- No TX-side software, because there is no TX chain. `loopback` fills the gap
+  for bring-up by replaying a recorded file, which exercises the receiver
+  without needing one.
+- **`loopback` has not been run on hardware yet** — the parsing and comparison
+  logic is host-tested, the DMA sequencing is not.
 - `radioctl` is a bring-up tool, not a library. A daemon holding the mappings
   open and exposing a socket would suit continuous operation better than a
   process that re-arms the DMA per invocation.
@@ -612,11 +668,14 @@ any stimulus buffer pushed the other way.
 | ⤷ `waveform_generator.py` | TX model: framed bursts, impairments, RRC taps |
 | ⤷ `rx_model.py` | Floating-point reference receiver, format self-check |
 | ⤷ `rx_expected.txt` | Per-frame expected output, incl. DMA metadata word |
+| ⤷ `rx_expected_stream.dat` | Exact S2MM beats, for both the RTL testbench and `radioctl loopback` |
+| ⤷ `rx_chunks.txt` | One playback sample range per frame, for `radioctl loopback` |
 | `vivado/create_project.tcl` | Full project + block design, scripted |
 | `zybo-br-tree/configs/` | `zybo_z720_defconfig`, `pynq_z1_defconfig` |
 | `zybo-br-tree/board/common/` | Zybo devicetree, boot script, kernel fragment |
 | `zybo-br-tree/board/pynq-z1/` | PYNQ devicetree, U-Boot patches |
-| `zybo-br-tree/package/radioctl/` | Userspace control tool |
+| `zybo-br-tree/package/radioctl/` | Userspace control tool, incl. the loopback demo |
+| `zybo-br-tree/package/radiomon/` | Live register monitor; vendored `plot_lib.hpp` |
 
 **RRC taps are generated, not hand-written.** `waveform_generator.py` emits both
 the stimulus and `rrc_coeffs` from one pulse-shape definition, at the correct

@@ -151,6 +151,27 @@ apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 -config $automat
 # GP1 -> DMA control/status
 # HP0/HP1 -> one per DMA channel, so TX and RX don't share DDR bandwidth
 # Fabric interrupt -> DMA transfer-complete back to the PS (for dma_proxy)
+#
+# FCLK0 = 40 MHz, and this is a TIMING decision, not a performance one.
+#
+# At 50 MHz the design missed by WNS = -1.017 ns on 96 endpoints, all of them
+# the matched filter's DSP48 cascade: matched_filter_rrc computes nine
+# multiplies and the whole adder tree between two flops, which routes as seven
+# chained DSP48E1s (PCOUT->PCIN) plus a CARRY4 chain - 19.27 ns of which 16.4 ns
+# is logic. Placement and routing cannot recover that; the cascade hops are
+# fixed silicon. 25 ns closes every failing endpoint with roughly 4 ns spare.
+#
+# It costs nothing real: the DSP chain advances one sample per data_valid, so
+# the fabric clock sets no sample rate and no throughput requirement the frame
+# sizes here care about. The proper fix is pipelining the filter's MAC, which
+# changes chain latency and so needs dsp_top's hand-counted valid delays moved
+# with it - a separate change with a simulation behind it.
+#
+# THIS VALUE ONLY SETS THE TIMING CONSTRAINT. Boot uses mainline U-Boot's
+# bundled ps7_init_gpl.c, not an FSBL generated from this project, so the rate
+# the hardware actually runs at comes from assigned-clock-rates in
+# board/common/zynq-zybo-z7-radio.dts. The two must be changed together or the
+# timing report stops describing the board.
 set_property -dict [list \
     CONFIG.PCW_USE_M_AXI_GP0 {1} \
     CONFIG.PCW_USE_M_AXI_GP1 {1} \
@@ -158,6 +179,7 @@ set_property -dict [list \
     CONFIG.PCW_USE_S_AXI_HP1 {1} \
     CONFIG.PCW_USE_FABRIC_INTERRUPT {1} \
     CONFIG.PCW_IRQ_F2P_INTR {1} \
+    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {40} \
 ] $ps
 
 # --- AXI DMA: PL <-> PS DDR bulk data path -------------------------------
@@ -384,7 +406,7 @@ connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_ports fc
 # here. ASSOCIATED_BUSIF ties the interfaces to the clock port so Vivado
 # propagates the frequency instead of falling back to its default.
 set pl_freq [get_property CONFIG.FREQ_HZ [get_bd_pins processing_system7_0/FCLK_CLK0]]
-if { $pl_freq eq "" } { set pl_freq 50000000 }
+if { $pl_freq eq "" } { set pl_freq 40000000 }
 
 set_property -dict [list \
     CONFIG.FREQ_HZ $pl_freq \
