@@ -569,6 +569,49 @@ of frames that passed CRC, so one early failure shifts it for every frame
 after — comparing it strictly would turn a single fault into a cascade of
 misleading failures, so the drift is reported rather than failed.
 
+#### Running it
+
+Three files are needed on the board, all produced by one `run_frames()` call in
+`waveform_generator.py`:
+
+| File | Carries |
+|---|---|
+| `ddc_input.dat` | The samples to play, one decimal value per line |
+| `rx_chunks.txt` | Where each frame starts and ends, so playback can be chunked |
+| `rx_expected_stream.dat` | The beats a correct receiver produces, for the verdict |
+
+**They are not installed in the rootfs** — nothing in the Buildroot overlay
+carries them, so they are copied over per run. That is deliberate: the stimulus
+is regenerated constantly during DSP work, and anything living in the rootfs can
+only be updated through the ramdisk-boot + `dd` cycle, which is far too heavy
+for a file that changes every time an impairment is turned up.
+
+```bash
+# from the repo root, on the dev host
+cd dsp-cake/comms_dsp/test_bench
+scp ddc_input.dat rx_chunks.txt rx_expected_stream.dat root@10.0.0.200:/root/
+
+# on the board
+radioctl loopback ddc_input.dat \
+    --chunks rx_chunks.txt \
+    --expect rx_expected_stream.dat \
+    --out captured.bin
+```
+
+**Copy all three together, every time.** They only describe each other if they
+came from the same generator run — a new `ddc_input.dat` against a stale
+`rx_expected_stream.dat` produces a confident, completely meaningless verdict.
+Nothing checks this; the files carry no run identifier.
+
+`--chunks` is optional and its absence is reported rather than silently
+tolerated: without it the whole file plays as one transfer, which is correct
+only for a single-frame stimulus. `--expect` is what makes the run mean
+anything — frame count plus CRC proves only that the receiver decoded something
+self-consistent, and a frame carrying the wrong bytes passes CRC every time.
+
+Run `radiomon` in a second SSH session to watch the quality trace move while
+this runs; the two programs are independent and neither invokes the other.
+
 ### 5.4 `radiomon`
 
 Live terminal plot of the lock-quality ratio, with the frame, error and sync

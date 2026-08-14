@@ -1096,23 +1096,10 @@ being played.
 
 ### Running it
 
-```sh
-# on the host: the stimulus, the chunk list and the expected beats
-scp dsp-cake/comms_dsp/test_bench/{ddc_input.dat,rx_chunks.txt,rx_expected_stream.dat} \
-    root@10.0.0.200:/root/
-
-# on the board
-radioctl loopback ddc_input.dat \
-    --chunks rx_chunks.txt \
-    --expect rx_expected_stream.dat \
-    --out captured.bin
-```
-
-`--chunks` is optional and its absence is reported, not silently tolerated —
-without it the whole file goes out as one transfer, which is correct only for a
-single-frame stimulus. `--expect` is what makes the run mean anything: frame
-count plus CRC only proves the receiver decoded something *self-consistent*, and
-a frame carrying the wrong bytes passes CRC every time.
+**How to invoke it lives in [system_design.md §5.3](system_design.md)**, with
+the other usage documentation — including which three files have to be copied to
+the board and why they are not installed in the rootfs. Not duplicated here:
+two copies of a command line is exactly the drift this project keeps paying for.
 
 ### What it reports, and one thing it deliberately does not fail on
 
