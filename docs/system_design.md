@@ -307,14 +307,24 @@ Base `0x43C0_0000`, all 32-bit. Authoritative definitions are `C_REG_*` in
 
 | Offset | Name | Access | Description |
 |---|---|---|---|
-| `0x00` | `ID_VERSION` | RO | `0x5A790001` — confirms which bitstream is loaded |
+| `0x00` | `ID_VERSION` | RO | `0x5A790002` — confirms which bitstream is loaded |
 | `0x04` | `CONTROL` | RW | Enable and command pulses |
-| `0x08` | `MODE` | RW | Role and modulation selection |
+| `0x08` | `MODE` | RW | Role, modulation and capture-tap selection |
 | `0x0C` | `STATUS` | RO | Chain state, driven from PL |
 | `0x10` | `TX_LEN` | RW | Transmit payload length, bytes |
 | `0x14` | `RX_LEN` | RO | Payload length of last good frame |
 | `0x18` | `FRAME_COUNT` | RO | Frames passing CRC since reset |
 | `0x1C` | `ERR_COUNT` | RO | Frames failing CRC since reset |
+| `0x400`–`0x13FC` | Capture RAM | RO | 1024 words, sample sniffer — see 4.4 |
+
+**`ID_VERSION` was `0x5A790001` before the diagnostic sample capture
+addition below.** Bumped per the low-half-on-register-map-changes convention
+already in `pkg.vhd` — new `CONTROL`/`MODE`/`STATUS` bits plus the whole
+capture RAM region are new since. Old `radioctl`/`radiomon` against this
+bitstream are unaffected (they never touch the new bits); new tools against
+an *old* bitstream would read the capture region as clamped control-register
+garbage rather than real samples — wrong, not a hang, but worth the id check
+catching outright rather than looking like a lock-quality problem.
 
 **`CONTROL` (0x04)**
 
@@ -324,6 +334,7 @@ Base `0x43C0_0000`, all 32-bit. Authoritative definitions are `C_REG_*` in
 | 1 | `TX_START` | Write-1 pulse, **self-clearing in PL** |
 | 2 | `RX_ENABLE` | Enables `frame_sync`; low holds it in reset |
 | 3 | `CLR_STATS` | Write-1 pulse, **self-clearing in PL** |
+| 4 | `CAPTURE_ARM` | Write-1 pulse, **self-clearing in PL** — arms the sample sniffer, see 4.4 |
 
 **`MODE` (0x08)**
 
@@ -332,6 +343,7 @@ Base `0x43C0_0000`, all 32-bit. Authoritative definitions are `C_REG_*` in
 | 0 | `ROLE` | 0 = RX, 1 = TX |
 | 3:1 | `MOD` | Modulation select — reserved, unused |
 | 7:4 | `SPREAD` | DSSS spreading factor — reserved, unused |
+| 9:8 | `CAPTURE_TAP` | Which RX chain stage the sniffer captures — see 4.4 |
 
 **`STATUS` (0x0C)**
 
@@ -341,11 +353,57 @@ Base `0x43C0_0000`, all 32-bit. Authoritative definitions are `C_REG_*` in
 | 1 | `PLL_LOCKED` | — | ⬜ tied 0, no lock detector |
 | 2 | `FRAME_VALID` | `frame_sync.in_frame` | ✅ high once synced |
 | 3 | `OVERFLOW` | `rx_frame_buffer` | ✅ frame dropped, buffer busy |
+| 4 | `BUILD_DIRTY` | `build_id_pkg` | ✅ bitstream built from an uncommitted tree |
+| 5 | `CAPTURE_DONE` | `sample_sniffer` | ✅ capture filled and froze; cleared by the next `CAPTURE_ARM` |
 
 Read-only offsets are driven from `status_reg` in `system_top.vhd`. `ID_VERSION`
 is answered by `reg_rw_interface` directly from `C_ID_MAGIC` and is deliberately
 *not* also driven through `status_reg` — two sources for one register invites
 drift.
+
+### 4.4 Diagnostic sample capture
+
+A second, much larger address region on the *same* AXI4-Lite bus as the
+registers above — not a second AXI slave, not the DMA. `sample_sniffer.vhd`
+freezes 1024 consecutive I/Q pairs from one selected RX chain stage into
+BRAM, single-shot: `CONTROL.CAPTURE_ARM` resets it and starts a fresh fill;
+once full it sets `STATUS.CAPTURE_DONE` and holds until armed again. The
+same store-and-forward shape `rx_frame_buffer` already uses, for the same
+reason — a frozen snapshot the PS reads at its own pace has no
+producer/consumer race to get wrong, where a free-running circular buffer
+would.
+
+**Deliberately its own module, not folded into `reg_rw_interface`.** The
+earlier `reg_rw_interface` rebuild dropped BRAM specifically because a
+read-latency, PL-driven bulk buffer does not fit the control path's
+single-cycle contract (see 5.2's `reg_rw_interface` note). This reintroduces
+BRAM only where it is actually needed, in its own module — the control path
+is untouched, still single-cycle, still exactly as it was proven working.
+
+**Reading the capture region costs one extra AXI wait state** versus the
+control region above — the BRAM's registered read latency, not a different
+protocol. `reg_rw_interface`'s read state machine issues the BRAM read while
+still accepting the address, then holds one more cycle before the data is
+valid; the PS side sees ordinary AXI4-Lite wait states either way.
+
+**`CAPTURE_TAP` (`MODE[9:8]`) — four stages, matching the RX chain diagram:**
+
+| Value | Tap | Answers |
+|---|---|---|
+| `00` | post-DDC | Is the carrier being removed at all? |
+| `01` | post-PLL | What is the matched filter actually receiving? |
+| `10` | post matched filter | Is the pulse shape/ISI what it should be? |
+| `11` | post-Gardner | Same point `rx_quality`'s ratio already summarizes — see it directly instead of inferring |
+
+**Packing:** I in the low 16 bits, Q in the high 16 bits of each word — the
+same convention the DMA payload packing already uses, so a hexdump of a
+captured word means the same thing here as everywhere else in this design.
+
+**The sniffer only advances while something is actively driving MM2S.**
+There is no free-running ADC in this design (`G_VALID_SRC = VALID_DMA`), so
+a capture has to run concurrently with a real source — `radioctl loopback`,
+or eventually live traffic — not on its own. See 5.4 for how to run one from
+`radiomon`.
 
 ### 4.3 Over-the-air frame format (v1)
 

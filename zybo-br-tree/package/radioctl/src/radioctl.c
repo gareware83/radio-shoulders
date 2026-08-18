@@ -56,22 +56,30 @@ enum {
 };
 
 /* CONTROL bits */
-#define CTRL_ENABLE     (1u << 0)
-#define CTRL_TX_START   (1u << 1)   /* write-one pulse, self-clearing in PL */
-#define CTRL_RX_ENABLE  (1u << 2)
-#define CTRL_CLR_STATS  (1u << 3)
+#define CTRL_ENABLE      (1u << 0)
+#define CTRL_TX_START    (1u << 1)   /* write-one pulse, self-clearing in PL */
+#define CTRL_RX_ENABLE   (1u << 2)
+#define CTRL_CLR_STATS   (1u << 3)
+#define CTRL_CAPTURE_ARM (1u << 4)   /* write-one pulse, self-clearing in PL */
 
 /* MODE bits */
-#define MODE_ROLE       (1u << 0)   /* 0 = RX, 1 = TX */
+#define MODE_ROLE              (1u << 0)   /* 0 = RX, 1 = TX */
+#define MODE_CAPTURE_TAP_SHIFT 8            /* 2 bits: which RX stage the
+                                              * sample sniffer captures from -
+                                              * see C_TAP_* in hdl/pkg.vhd */
+#define MODE_CAPTURE_TAP_MASK  (0x3u << MODE_CAPTURE_TAP_SHIFT)
 
 /* STATUS bits */
-#define STAT_TX_BUSY     (1u << 0)
-#define STAT_PLL_LOCKED  (1u << 1)
-#define STAT_FRAME_VALID (1u << 2)
-#define STAT_OVERFLOW    (1u << 3)
-#define STAT_BUILD_DIRTY (1u << 4)
+#define STAT_TX_BUSY      (1u << 0)
+#define STAT_PLL_LOCKED   (1u << 1)
+#define STAT_FRAME_VALID  (1u << 2)
+#define STAT_OVERFLOW     (1u << 3)
+#define STAT_BUILD_DIRTY  (1u << 4)
+#define STAT_CAPTURE_DONE (1u << 5)
 
-#define ID_MAGIC 0x5A790001u
+/* Bumped 0x0001 -> 0x0002 for the sample-capture register/address-map
+ * additions - see the comment on C_ID_MAGIC in hdl/pkg.vhd. */
+#define ID_MAGIC 0x5A790002u
 
 /*
  * AXI DMA register offsets, Simple mode (SG is disabled in the IP - see the

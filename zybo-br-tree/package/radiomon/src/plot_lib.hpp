@@ -14,6 +14,28 @@
  * types and template deduction fails. It builds fine on the development
  * machine and fails only when cross-compiled for the board, which is the
  * awkward way round to find out.
+ *
+ * NOT a local change, but worth knowing before touching this file again:
+ * frame()/margin() SEGFAULT on this build (g++ 11.4.0, both host and the
+ * ARM cross toolchain) - confirmed against the pristine, un-repacked
+ * upstream source too, so it is not something the packing step introduced.
+ * Root cause traced as far as: any text label passed to frame() runs
+ * through utf8_string_width() -> wcwidth() -> unicode_cp_in_tree(), which
+ * walks a large self-referential static const tree defined in
+ * unicode_data.hpp (Unicode east-asian-width data). The root node's own
+ * fields read back correctly, but the node reached via ITS first child
+ * pointer does not - the memory at that (correctly-computed) address holds
+ * data that does not match the literal initializer in the source. That
+ * smells like a codegen/linking problem with this specific "static array of
+ * structs containing pointers computed as &array[N] within the array's own
+ * initializer" pattern on this toolchain, not a logic bug reachable by
+ * fixing call sites - not chased further since it is upstream's bug, not
+ * this file's, and every user of BrailleCanvas/RealCanvas in this project
+ * (radiomon.cpp) now avoids frame()/margin() entirely instead: a plain
+ * std::cout header string followed by streaming the canvas object directly
+ * (BrailleCanvas has its own operator<<, confirmed not to touch this code
+ * path). Re-verify this crash is actually fixed upstream before
+ * reintroducing frame()/margin() to this codebase.
  */
 
 /**

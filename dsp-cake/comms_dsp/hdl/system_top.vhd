@@ -118,6 +118,27 @@ signal rx_qual_min    : unsigned(31 downto 0);
 signal rx_qual_max    : unsigned(31 downto 0);
 signal rx_qual_syms   : unsigned(31 downto 0);
 
+-- Diagnostic sample sniffer (sample_sniffer.vhd) - see the "Diagnostic
+-- sample capture" section of pkg.vhd for the address map and register bits
+-- this all hangs off. Taps come straight from dsp_top's new tap_* outputs;
+-- the capture RAM read port is reached through reg_rw_interface's new
+-- capture_rd_* ports rather than a second AXI slave - see the note at the
+-- top of reg_rw_interface.vhd for why.
+signal tap_ddc_i, tap_ddc_q           : signed(15 downto 0);
+signal tap_ddc_valid                  : std_logic;
+signal tap_pll_i, tap_pll_q           : signed(15 downto 0);
+signal tap_pll_valid                  : std_logic;
+signal tap_filtered_i, tap_filtered_q : signed(15 downto 0);
+signal tap_filtered_valid             : std_logic;
+signal tap_sym_i, tap_sym_q           : signed(15 downto 0);
+signal tap_sym_valid                  : std_logic;
+
+signal capture_arm     : std_logic;    -- one-clock pulse from a CONTROL write
+signal capture_done    : std_logic;
+signal capture_rd_addr : natural range 0 to C_CAPTURE_DEPTH - 1;
+signal capture_rd_en   : std_logic;
+signal capture_rd_data : std_logic_vector(31 downto 0);
+
 begin
 
 -- status_reg is what the PS reads back at the RO offsets. Anything the PL
@@ -150,6 +171,10 @@ begin
     -- clean at the time. Constants from the generated build_id_pkg.
     status_reg(C_REG_BUILD_ID)                 <= C_BUILD_ID;
     status_reg(C_REG_STATUS)(C_STAT_BUILD_DIRTY) <= C_BUILD_DIRTY;
+
+    -- Diagnostic sample sniffer: set once a single-shot capture has filled
+    -- and frozen, cleared by the next CONTROL.CAPTURE_ARM.
+    status_reg(C_REG_STATUS)(C_STAT_CAPTURE_DONE) <= capture_done;
 end process;
 
 -- PS7 hands out an active-low reset; dsp_top wants active high, the AXI
@@ -258,6 +283,20 @@ uut : entity work.dsp_top
     ,qual_min    => rx_qual_min
     ,qual_max    => rx_qual_max
     ,qual_syms   => rx_qual_syms
+
+    -- sniffer taps
+    ,tap_ddc_i         => tap_ddc_i
+    ,tap_ddc_q         => tap_ddc_q
+    ,tap_ddc_valid     => tap_ddc_valid
+    ,tap_pll_i         => tap_pll_i
+    ,tap_pll_q         => tap_pll_q
+    ,tap_pll_valid     => tap_pll_valid
+    ,tap_filtered_i     => tap_filtered_i
+    ,tap_filtered_q     => tap_filtered_q
+    ,tap_filtered_valid => tap_filtered_valid
+    ,tap_sym_i         => tap_sym_i
+    ,tap_sym_q         => tap_sym_q
+    ,tap_sym_valid     => tap_sym_valid
   );
 
 reg_inst : entity work.reg_rw_interface
@@ -287,6 +326,41 @@ reg_inst : entity work.reg_rw_interface
     ,status_reg              => status_reg
     ,tx_start                => tx_start
     ,clr_stats               => clr_stats
+    ,capture_arm             => capture_arm
+    ,capture_rd_addr         => capture_rd_addr
+    ,capture_rd_en           => capture_rd_en
+    ,capture_rd_data         => capture_rd_data
+  );
+
+sniffer_inst : entity work.sample_sniffer
+  port map (
+     clk => clk
+    ,rst => rst
+
+    ,ddc_i     => tap_ddc_i
+    ,ddc_q     => tap_ddc_q
+    ,ddc_valid => tap_ddc_valid
+
+    ,pll_i     => tap_pll_i
+    ,pll_q     => tap_pll_q
+    ,pll_valid => tap_pll_valid
+
+    ,filtered_i     => tap_filtered_i
+    ,filtered_q     => tap_filtered_q
+    ,filtered_valid => tap_filtered_valid
+
+    ,sym_i     => tap_sym_i
+    ,sym_q     => tap_sym_q
+    ,sym_valid => tap_sym_valid
+
+    ,tap_sel => fpga_reg(C_REG_MODE)(C_MODE_CAPTURE_TAP_RANGE)
+
+    ,arm  => capture_arm
+    ,done => capture_done
+
+    ,rd_addr => capture_rd_addr
+    ,rd_en   => capture_rd_en
+    ,rd_data => capture_rd_data
   );
 
 end;

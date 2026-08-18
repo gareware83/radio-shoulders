@@ -27,6 +27,10 @@ constant C_DATA_WIDTH : natural := 32;
 --   0x28  QUAL_MAX     RO
 --   0x2C  QUAL_SYMS    RO
 --   0x30  BUILD_ID     RO
+--
+--   0x400 .. 0x13FC  CAPTURE RAM  RO  1024 words, one AXI wait state slower
+--                                     to read than the region above - see
+--                                     "Diagnostic sample capture" below.
 ------------------------------------------------------------------------------
 constant C_REG_ID          : natural := 0;
 constant C_REG_CONTROL     : natural := 1;
@@ -70,18 +74,40 @@ constant C_REG_COUNT : natural := 13;  -- number of addressable words
 
 -- Read back at ID_VERSION to confirm which bitstream is loaded.
 -- "Zy" + version; bump the low half on register map changes.
-constant C_ID_MAGIC : std_logic_vector(31 downto 0) := x"5A790001";
+--
+-- Bumped 0x0001 -> 0x0002 for the diagnostic sample capture addition: new
+-- CONTROL/MODE/STATUS bits and a new address region. Old radioctl/radiomon
+-- against this bitstream are unaffected (they never touch the new bits), but
+-- new radioctl/radiomon against an OLD bitstream would read the capture
+-- region as clamped control-register garbage rather than real samples -
+-- wrong, not a hang, but worth the id check catching definitively rather
+-- than leaving it to look like a lock-quality problem.
+constant C_ID_MAGIC : std_logic_vector(31 downto 0) := x"5A790002";
 
 -- CONTROL bit positions
 constant C_CTRL_ENABLE    : natural := 0;
 constant C_CTRL_TX_START  : natural := 1;   -- write-one pulse, self-clearing
 constant C_CTRL_RX_ENABLE : natural := 2;
 constant C_CTRL_CLR_STATS : natural := 3;   -- write-one pulse, self-clearing
+-- Arms the diagnostic sample sniffer: write-one pulse, self-clearing, same
+-- shape as CLR_STATS. Resets the sniffer's write pointer and starts a new
+-- single-shot fill of C_CAPTURE_DEPTH samples from whichever stage
+-- MODE.CAPTURE_TAP selects. See "Diagnostic sample capture" below.
+constant C_CTRL_CAPTURE_ARM : natural := 4;
 
 -- MODE bit positions
 constant C_MODE_ROLE      : natural := 0;   -- '0' = RX, '1' = TX
 subtype  C_MODE_MOD_RANGE   is natural range 3 downto 1;
 subtype  C_MODE_SPREAD_RANGE is natural range 7 downto 4;
+-- Which RX chain stage the sample sniffer captures from. Raw bits, not an
+-- enum - consistent with MOD_RANGE/SPREAD_RANGE above, both plain
+-- PS-writable fields rather than something decided at synthesis time (that
+-- is what the generics/valid_src_t enum are for).
+subtype  C_MODE_CAPTURE_TAP_RANGE is natural range 9 downto 8;
+constant C_TAP_DDC       : std_logic_vector(1 downto 0) := "00";  -- post-DDC
+constant C_TAP_PLL       : std_logic_vector(1 downto 0) := "01";  -- post-PLL, matched filter's input
+constant C_TAP_FILTERED  : std_logic_vector(1 downto 0) := "10";  -- post matched filter
+constant C_TAP_SYM       : std_logic_vector(1 downto 0) := "11";  -- post-Gardner, slicer's input
 
 -- STATUS bit positions (driven from PL)
 constant C_STAT_TX_BUSY     : natural := 0;
@@ -91,6 +117,52 @@ constant C_STAT_OVERFLOW    : natural := 3;
 -- Set when the bitstream was built from a tree with uncommitted changes, i.e.
 -- BUILD_ID does not fully identify what is in the PL.
 constant C_STAT_BUILD_DIRTY : natural := 4;
+-- Sample sniffer has filled and frozen; stays set until the next
+-- CONTROL.CAPTURE_ARM. See "Diagnostic sample capture" below.
+constant C_STAT_CAPTURE_DONE : natural := 5;
+
+------------------------------------------------------------------------------
+-- Diagnostic sample capture
+--
+-- A second, much larger region of the SAME 64K AXI4-Lite window as the
+-- control/status registers above, backed by BRAM in sample_sniffer.vhd
+-- rather than the flop array reg_rw_interface uses for CONTROL/STATUS/etc.
+-- Deliberately a separate module rather than folded into reg_rw_interface -
+-- the earlier reg_rw_interface rebuild dropped BRAM specifically because a
+-- read-latency, PL-driven bulk buffer does not fit the control path's
+-- single-cycle contract; this reintroduces BRAM only for the one thing that
+-- actually needs it, in its own module, leaving the control path exactly as
+-- it was proven working.
+--
+-- Word offset 256 (byte 0x400) is the boundary: below it is the control
+-- region (word_index unchanged in meaning, still clamped to C_REG_COUNT-1 for
+-- anything unimplemented - see reg_rw_interface's word_index for why that
+-- clamp is a documented gotcha, not a bug); at or above it, word_index -
+-- C_CAPTURE_BASE_WORD addresses the capture RAM, clamped to
+-- C_CAPTURE_DEPTH-1 the same way rather than left to read undefined data.
+--
+-- Reading the capture region costs one extra AXI wait state versus the
+-- control region's single-cycle response - the BRAM's registered read
+-- latency, not a protocol difference the PS needs to know about; the AXI
+-- handshake itself is identical either way, just slower on this address
+-- range. reg_rw_interface's read FSM accounts for this explicitly rather
+-- than assuming every address responds in one cycle.
+constant C_CAPTURE_BASE_WORD : natural := 256;
+constant C_CAPTURE_DEPTH     : natural := 1024;  -- I/Q pairs, one 32-bit word each
+constant C_CAPTURE_ADDR_W    : natural := 10;    -- 2**C_CAPTURE_ADDR_W = C_CAPTURE_DEPTH,
+                                                  -- checked at elaboration in
+                                                  -- sample_sniffer rather than
+                                                  -- derived, so the two
+                                                  -- constants disagreeing is a
+                                                  -- loud failure, not a
+                                                  -- silently wrapped pointer.
+
+-- Packing within a captured word: I in the low half, Q in the high half -
+-- the same convention the DMA payload packing already uses elsewhere in this
+-- design, so a hexdump of a captured word means the same thing to a human
+-- reading it as everywhere else in this codebase.
+subtype C_CAPTURE_I_RANGE is natural range 15 downto 0;
+subtype C_CAPTURE_Q_RANGE is natural range 31 downto 16;
 
 -- PS -> PL: the writable registers, one entry per word offset. Read-only
 -- offsets are present but unused in this array.

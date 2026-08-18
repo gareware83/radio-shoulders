@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.signal import lfilter
+from scipy.signal import lfilter, welch
 import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
@@ -575,12 +575,332 @@ class RRCWaveformGenerator:
         self.check_filter_scaling(quantized, taps)
 
         if plot:
-            self._plot_burst(quantized, symbols, manifest)
+            self._plot_burst(quantized, symbols, manifest, freq_err_hz=freq_err_hz)
 
         return quantized, manifest
 
-    def _plot_burst(self, quantized, symbols, manifest):
-        fig, ax = plt.subplots(2, 1, figsize=(12, 6))
+    # -----------------------------------------------------------------
+    # Spectral analysis
+    # -----------------------------------------------------------------
+    def _welch_psd_db(self, samples, fs, nperseg=None):
+        """Two-sided PSD, peak-normalized to 0 dB, one Nyquist period.
+
+        return_onesided=False is requested unconditionally, for real and
+        complex input alike, so freqs always comes back in fftfreq order
+        (0, positive, negative) over the full [-fs/2, fs/2) - one code path
+        instead of a real/complex branch. fftshift then sorts it ascending.
+
+        nperseg defaults to the WHOLE signal (nperseg=None -> nperseg=len) -
+        one long window, not Welch-averaged segments. That is the right
+        default here specifically because these stimuli are short and mostly
+        deterministic: a single window gives maximum frequency resolution,
+        which is what distinguishing the RRC main lobe from its first
+        sidelobe needs. Pass a smaller nperseg to average down noise on a
+        longer, noisier capture instead.
+        """
+        samples = np.asarray(samples)
+        n = len(samples)
+        if nperseg is None:
+            nperseg = n
+        noverlap = nperseg // 2 if nperseg < n else 0
+
+        freqs, pxx = welch(samples, fs=fs, window="hann", nperseg=nperseg,
+                           noverlap=noverlap, return_onesided=False,
+                           scaling="spectrum", detrend=False)
+        freqs = np.fft.fftshift(freqs)
+        pxx = np.fft.fftshift(pxx)
+        psd_db = 10 * np.log10(pxx / np.max(pxx) + 1e-300)
+        return freqs, psd_db
+
+    def _tile_psd(self, freqs, psd_db, fs, span_fs):
+        """Extends a one-period PSD to span_fs * fs by repeating it.
+
+        A sampled signal's DTFT is exactly periodic with period fs, so this
+        is a faithful tiling of the same computed spectrum, not an
+        oversampled re-analysis or an interpolation - the extra copies are
+        real content, not decoration. Its only purpose is to make the
+        periodicity itself visible (span_fs > 1) around the single unique
+        period any peak-finding is done on.
+        """
+        half = span_fs * fs / 2.0
+        reps = int(np.ceil(half / fs)) + 1
+        freqs_t = np.concatenate([freqs + k * fs for k in range(-reps, reps + 1)])
+        psd_t = np.tile(psd_db, 2 * reps + 1)
+        order = np.argsort(freqs_t)
+        freqs_t, psd_t = freqs_t[order], psd_t[order]
+        mask = (freqs_t >= -half) & (freqs_t <= half)
+        return freqs_t[mask], psd_t[mask]
+
+    def _null_then_sidelobe(self, psd_db, start, step, hysteresis_db=3.0):
+        """From index `start` (the main lobe's peak), walks outward finding
+        the first genuine valley (the null) and the peak that follows it (the
+        first sidelobe), via hysteresis rather than a fixed dB-drop.
+
+        A fixed drop does not work: it has to clear in-band ripple (a few
+        tenths of a dB on a short filter's passband top) without stopping
+        early, but ALSO has to reach the true bottom of the rolloff before
+        declaring victory - and those need very different thresholds. On the
+        9-tap RX filter here the rolloff genuinely runs ~34 dB deep before
+        the first real sidelobe (at only ~-25 dB) even begins, so a 6 dB
+        threshold - comfortably clear of the passband ripple - stops in the
+        middle of the descent and reports the null itself as "the sidelobe".
+        There is no single fixed number that is simultaneously bigger than
+        the ripple and smaller than the rolloff depth for every alpha/span.
+
+        Hysteresis sidesteps needing to know either number in advance: track
+        a running minimum while descending, and only flip to "ascending"
+        once the curve has RISEN hysteresis_db above that minimum - a
+        genuine reversal, whatever depth it happens at. Then track a running
+        maximum while ascending, and confirm it as the sidelobe once the
+        curve FALLS hysteresis_db back down - a genuine peak, not another
+        ripple tick. Small ripples in either direction, at either the
+        passband top or partway down the rolloff, never trip either flip
+        because they do not clear hysteresis_db.
+
+        Returns (null_idx, sidelobe_idx, confirmed). Runs off the array
+        before the ascent falls back down by hysteresis_db - a real case: a
+        wide-rolloff filter's transition band can still be rising when it
+        hits the edge of a single Nyquist period, seen directly on this
+        file's own alpha=0.6 case - and sidelobe_idx is then a best-effort
+        (the highest point reached), with confirmed=False so callers and the
+        printed report can say so rather than presenting a partial read with
+        the same confidence as a genuine peak-then-fall. null_idx/sidelobe_idx
+        are both None if not even a null was found (a monotonic run all the
+        way to the edge).
+        """
+        i, n = start, len(psd_db)
+        run_min, min_idx = psd_db[start], start
+        run_max, max_idx = psd_db[start], start
+        descending = True
+        null_idx = None
+
+        while 0 <= i + step < n:
+            i += step
+            v = psd_db[i]
+            if descending:
+                if v < run_min:
+                    run_min, min_idx = v, i
+                elif v - run_min >= hysteresis_db:
+                    null_idx = min_idx
+                    descending = False
+                    run_max, max_idx = v, i
+            else:
+                if v > run_max:
+                    run_max, max_idx = v, i
+                elif run_max - v >= hysteresis_db:
+                    return null_idx, max_idx, True
+
+        return null_idx, (max_idx if null_idx is not None else None), False
+
+    def _lobe_sidelobe_ratio(self, freqs, psd_db, hysteresis_db=3.0):
+        """Main lobe peak and its first genuine sidelobe on either side - see
+        _null_then_sidelobe for how "genuine" is decided.
+
+        Run on ONE untiled period. Running it on the tiled display array
+        would let a periodic repeat of the main lobe itself register as a
+        neighbour once span_fs > 1.
+        """
+        main = int(np.argmax(psd_db))
+        _, left_side, left_ok = self._null_then_sidelobe(psd_db, main, -1, hysteresis_db)
+        _, right_side, right_ok = self._null_then_sidelobe(psd_db, main, +1, hysteresis_db)
+
+        candidates = [(c, ok) for c, ok in ((left_side, left_ok), (right_side, right_ok))
+                     if c is not None]
+        if not candidates:
+            return None
+
+        side, confirmed = candidates[int(np.argmax([psd_db[c] for c, _ in candidates]))]
+        return {
+            "main_freq": freqs[main], "main_db": psd_db[main],
+            "side_freq": freqs[side], "side_db": psd_db[side],
+            "ratio_db": psd_db[main] - psd_db[side],
+            "confirmed": confirmed,
+        }
+
+    def plot_spectrum(self, samples, fs=None, freq_err_hz=None, span_fs=2.0,
+                      downconvert_fs4=True, nperseg=None, hysteresis_db=3.0,
+                      ax=None, title=None):
+        """Power spectral density, for verifying carrier offset and RRC shape.
+
+        downconvert_fs4=True (the default, and the point of this method)
+        numerically mixes `samples` down by EXACTLY fs/4 first, with an ideal
+        complex exponential - the same target ddc_fs_4 removes in hardware,
+        but computed exactly rather than the hardware's four-phase sign-flip
+        approximation. What is left afterwards is ground truth for what a
+        CORRECT downconverter would hand the rest of the chain: a baseband
+        main lobe sitting at 0 Hz plus whatever residual carrier offset
+        (freq_err_hz) was deliberately left for the PLL to track. If the lobe
+        is missing, split, or in the wrong place, the fault is upstream of
+        the PLL's residual - the DDC itself, or the carrier the stimulus was
+        actually built at.
+
+        span_fs sets how much of the periodic spectrum is shown, in units of
+        fs (default 2.0 -> -fs to +fs, one full period either side of the
+        analysed one) - see _tile_psd for why this is an exact tiling and not
+        an approximation. Nyquist (+-fs/2) is marked, since content beyond it
+        is a repeat of the same period, not new information.
+
+        Prints and annotates the main lobe's frequency and its ratio to fs -
+        .dat files carry no time base (see the note in __main__), so
+        carrier/fs is the portable quantity; freq_err_hz alone is only
+        meaningful for the fs value this stimulus happens to have been
+        generated at.
+
+        A sidelobe ratio is reported too, but DO NOT use it to judge the RRC
+        filter - use plot_rrc_response() for that. Two things corrupt it
+        here: a framed burst's preamble is a long, strongly periodic
+        alternating-symbol run BY DESIGN (it exists to give the loops
+        something to lock onto), and its Nyquist tone dominates a whole-burst
+        FFT outright - on the current on-disk stimulus it out-levels the
+        actual carrier lobe by ~20 dB, so a naive peak-finder reports the
+        preamble's tone as "the main lobe". And on unframed random data, a
+        single-window periodogram is high-variance and does not converge to
+        the smooth theoretical PSD without segment averaging - tried directly
+        on random QPSK, it reported a main lobe and sidelobe both simply
+        wrong, tens of kHz from where they should be. This method's real job
+        is the carrier-offset question, best asked of a signal built for it -
+        run_carrier_probe()'s constant-symbol probe, or a payload-only slice.
+        """
+        fs = self.fs if fs is None else fs
+        samples = np.asarray(samples)
+
+        if downconvert_fs4:
+            n = np.arange(len(samples))
+            samples = samples.astype(complex) * np.exp(-1j * 2 * np.pi * (fs / 4) * n / fs)
+
+        freqs, psd_db = self._welch_psd_db(samples, fs, nperseg=nperseg)
+        label = "baseband after ideal fs/4 removal" if downconvert_fs4 else "as given"
+        return self._render_spectrum(freqs, psd_db, fs, span_fs, ax,
+                                     title or ("Baseband spectrum (ideal fs/4 removed)"
+                                              if downconvert_fs4 else "Spectrum"),
+                                     freq_err_hz, label, hysteresis_db)
+
+    def plot_rrc_response(self, sps=None, span=None, fs=None, span_fs=2.0,
+                          nfft=8192, hysteresis_db=3.0, ax=None, title=None):
+        """Frequency response of the RRC pulse ITSELF - the filter-only check.
+
+        plot_spectrum() on modulated data cannot answer "is the filter shaped
+        correctly": a single-window periodogram of random QPSK data is high
+        variance and does not converge to the smooth theoretical spectrum
+        without segment averaging, and averaging costs the frequency
+        resolution this check needs. Confirmed by trying it - on unmodulated
+        random data the reported main lobe and sidelobe were simply wrong,
+        off by tens of kHz, because the periodogram is noisy rather than
+        because anything was mis-measured.
+
+        This sidesteps that: it FFTs generate_rrc_filter()'s tap values
+        directly (zero-padded to nfft for display resolution - the filter
+        itself is unchanged, only the plotted curve gets smoother). No data,
+        no noise, no averaging tradeoff - the result depends only on alpha,
+        span and sps, exactly the quantities under test, and is exactly
+        reproducible.
+
+        sps/span default to the RX-rate filter (self.sps // 2, matching
+        FILTER_LEN in dsp_pkg.vhd) rather than the TX shaping rate, since
+        that is the filter actually loaded into hardware.
+
+        fs is a display convenience only, translating cycles/sample into Hz
+        for the x-axis - the taps carry no inherent Hz, same as everywhere
+        else in this file (see the note in __main__). IMPORTANT: it defaults
+        to symbol_rate * sps, NOT self.fs. self.fs is specifically the TX
+        shaping rate's sample rate (sps samples/symbol at self.sps); a tap
+        sequence generated at a DIFFERENT sps - the RX-rate default here is
+        exactly that - has its own, different, native sample rate. Using
+        self.fs regardless would stretch the frequency axis by
+        self.sps / sps (2x for the RX-rate default), mislabeling every
+        Hz value while leaving the fractional/normalized shape untouched -
+        caught by hand-checking a sidelobe frequency against the tap
+        sequence's own Nyquist boundary before trusting this method's output.
+        """
+        sps = self.sps // 2 if sps is None else sps
+        fs = self.symbol_rate * sps if fs is None else fs
+        taps = self.generate_rrc_filter(sps=sps, span=span)
+
+        h = np.zeros(nfft, dtype=complex)
+        h[:len(taps)] = taps
+        H = np.fft.fftshift(np.fft.fft(h))
+        freqs = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / fs))
+        psd_db = 20 * np.log10(np.abs(H) / np.max(np.abs(H)) + 1e-300)
+
+        return self._render_spectrum(freqs, psd_db, fs, span_fs, ax,
+                                     title or f"RRC response (alpha={self.alpha}, "
+                                              f"{sps} sps, {span or self.span}-symbol span)",
+                                     None, f"RRC taps only, {len(taps)} taps", hysteresis_db)
+
+    def _render_spectrum(self, freqs, psd_db, fs, span_fs, ax, title,
+                         expected_freq_hz, source_label, hysteresis_db=3.0):
+        """Shared plot/annotate/report tail for plot_spectrum() and
+        plot_rrc_response() - the two differ only in how freqs/psd_db were
+        computed (Welch of data vs. zero-padded FFT of taps), not in how the
+        result is read.
+        """
+        lobe = self._lobe_sidelobe_ratio(freqs, psd_db, hysteresis_db)
+        freqs_disp, psd_disp = self._tile_psd(freqs, psd_db, fs, span_fs)
+
+        own_fig = ax is None
+        if own_fig:
+            _, ax = plt.subplots(figsize=(10, 4))
+
+        ax.plot(freqs_disp, psd_disp, linewidth=0.8)
+        ax.axvline(0.0, color="black", linewidth=0.8, linestyle=":")
+        for edge in (-fs / 2, fs / 2):
+            ax.axvline(edge, color="gray", linewidth=0.8, linestyle="--")
+
+        if expected_freq_hz is not None:
+            ax.axvline(expected_freq_hz, color="tab:orange", linewidth=1.0, linestyle="--",
+                       label=f"expected offset {expected_freq_hz:+.1f} Hz")
+
+        if lobe is not None:
+            ax.plot(lobe["main_freq"], lobe["main_db"], "o", color="tab:red",
+                    label=f"main lobe {lobe['main_freq']:+.1f} Hz")
+            unconfirmed = "" if lobe["confirmed"] else " (unconfirmed - see below)"
+            ax.plot(lobe["side_freq"], lobe["side_db"],
+                    "x" if lobe["confirmed"] else "^",
+                    color="tab:purple" if lobe["confirmed"] else "tab:gray",
+                    label=f"1st sidelobe, {lobe['ratio_db']:.1f} dB down{unconfirmed}")
+
+        ax.set_xlim(-span_fs * fs / 2, span_fs * fs / 2)
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("dB, peak-normalized")
+        ax.set_title(title)
+        ax.grid(True)
+        ax.legend(fontsize=8, loc="lower right")
+
+        print(f"[i] spectrum ({source_label}):")
+        if lobe is not None:
+            f0 = lobe["main_freq"]
+            print(f"    main lobe     {f0:+.1f} Hz   (f/fs = {f0 / fs:+.5f})")
+            if expected_freq_hz is not None:
+                print(f"    expected      {expected_freq_hz:+.1f} Hz   "
+                      f"(f/fs = {expected_freq_hz / fs:+.5f})   "
+                      f"-> measured is {f0 - expected_freq_hz:+.1f} Hz off")
+            print(f"    1st sidelobe  {lobe['side_freq']:+.1f} Hz, "
+                  f"{lobe['ratio_db']:.1f} dB down (alpha={self.alpha})")
+            if not lobe["confirmed"]:
+                print(f"    NOTE: unconfirmed - the rolloff was still rising "
+                      f"at +-fs/2 (+-{fs / 2:.0f} Hz), the edge of the ONE "
+                      f"Nyquist period this is measured over, so this is the "
+                      f"highest point SEEN rather than a confirmed peak-then-"
+                      f"fall. No parameter here fixes this - span_fs only "
+                      f"re-tiles the same one-period result for display, and "
+                      f"nfft only adds resolution within it, neither extends "
+                      f"what is actually being analysed. Read literally, this "
+                      f"is real: it means the transition band has not turned "
+                      f"over within the filter's own Nyquist bandwidth - worth")
+                print(f"          knowing on its own terms, not just a "
+                      f"reporting gap. Treat the ratio as a lower bound.")
+        else:
+            print("    no clear main lobe found - try a smaller nperseg or "
+                  "a smaller hysteresis_db")
+
+        if own_fig:
+            plt.tight_layout()
+            plt.show()
+
+        return lobe
+
+    def _plot_burst(self, quantized, symbols, manifest, freq_err_hz=None):
+        fig, ax = plt.subplots(3, 1, figsize=(12, 9))
 
         ax[0].plot(quantized, linewidth=0.6)
         ax[0].set_title("Transmitted burst (quantized ADC input)")
@@ -599,8 +919,66 @@ class RRCWaveformGenerator:
         ax[1].set_xlabel("Sample index")
         ax[1].grid(True)
 
+        self.plot_spectrum(quantized, freq_err_hz=freq_err_hz, ax=ax[2])
+
         plt.tight_layout()
         plt.show()
+
+    def run_carrier_probe(self, n_symbols=1024, filename="probe_const.dat",
+                          plot=False):
+        """Constant-symbol stimulus, for isolating carrier recovery alone.
+
+        Every symbol is the SAME constellation point (1+1j), pulse shaped and
+        upconverted to exactly fs/4. No framing, no impairments, no noise.
+
+        What makes it a probe rather than a stimulus: after a correct DDC the
+        baseband is a constant, so the slicer input should sit still on one
+        diagonal point and rx_quality's min/max ratio should read close to 1.0.
+        Nothing else in the chain can produce that number:
+
+          ~1.0   carrier removal works. The fault is downstream - timing,
+                 slicing or framing.
+          ~0.41  no carrier removal. Either the DDC is not mixing correctly or
+                 the PLL is spinning the constellation itself. 0.41 is the
+                 value for BOTH a uniformly rotating constellation and for
+                 noise-like I/Q, so it says "no structure", not which.
+
+        It also isolates carrier from timing on purpose: an RRC-shaped constant
+        symbol stream is constant between symbol instants too, so a wrong
+        sampling phase barely changes the answer. Gardner cannot be blamed for
+        a bad reading here, which is exactly what makes it worth running before
+        touching the loops.
+
+        Read the result with:  radioctl clrstats
+                               radioctl loopback probe_const.dat
+                               radioctl read qmin / qmax   (or radiomon)
+
+        It will report a capture timeout - correct, there are no frames in it.
+        The quality accumulators are the output.
+        """
+        symbols = np.ones(n_symbols, dtype=complex) * (1 + 1j)
+
+        rrc = self.generate_rrc_filter()
+        shaped = self.upsample_and_filter(symbols, rrc)
+
+        # Exactly fs/4, no residual: ddc_fs_4 removes precisely this, so a
+        # working front end leaves nothing for the PLL to do.
+        rf = self.apply_frequency_offset(shaped, freq=self.fs / 4)
+
+        rf = rf / np.max(np.abs(rf))
+        quantized = self.quantize(rf, headroom=0.5).astype(np.int16)
+
+        self.save_to_file(quantized, filename)
+        print(f"[i] Constant-symbol probe: expect quality ~1.0 if the DDC is "
+              f"removing the carrier, ~0.41 if it is not.")
+
+        if plot:
+            # No freq_err was added (upconverted at exactly fs/4), so the
+            # correct-DDC prediction is a single lobe sitting at 0 Hz.
+            self.plot_spectrum(quantized, freq_err_hz=0.0,
+                               title="Carrier probe: baseband after ideal fs/4 removal")
+
+        return quantized
 
     def run(self):
         """Original single-burst random-symbol stimulus, no framing.

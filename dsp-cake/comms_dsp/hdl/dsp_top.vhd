@@ -40,7 +40,30 @@ entity dsp_top is
         sync_count  : out unsigned(15 downto 0);
         qual_min    : out unsigned(31 downto 0);
         qual_max    : out unsigned(31 downto 0);
-        qual_syms   : out unsigned(31 downto 0)
+        qual_syms   : out unsigned(31 downto 0);
+
+        -- Tap points for the diagnostic sample sniffer (sample_sniffer.vhd,
+        -- instantiated in system_top). Named tap_* rather than reusing the
+        -- internal signal names below, since a port and an architecture
+        -- signal cannot share a name - these are plain concurrent copies of
+        -- ddc_i/q, mf_i/q, filtered_i/q and sym_i/q, added for visibility
+        -- only and driving nothing else in this entity.
+        tap_ddc_i        : out signed(15 downto 0);
+        tap_ddc_q        : out signed(15 downto 0);
+        tap_ddc_valid    : out std_logic;
+
+        tap_pll_i        : out signed(15 downto 0);   -- post-PLL (= mf_i/q,
+        tap_pll_q        : out signed(15 downto 0);   -- the matched filter's
+        tap_pll_valid    : out std_logic;              -- input either way
+                                                        -- G_PLL is set)
+
+        tap_filtered_i     : out signed(15 downto 0);
+        tap_filtered_q     : out signed(15 downto 0);
+        tap_filtered_valid : out std_logic;
+
+        tap_sym_i        : out signed(15 downto 0);
+        tap_sym_q        : out signed(15 downto 0);
+        tap_sym_valid    : out std_logic
     );
 end dsp_top;
 
@@ -290,5 +313,28 @@ inst_rxbuf : entity work.rx_frame_buffer
         ,overflow    => overflow
         ,rx_len      => rx_len
     );
+
+------------------------------------------------------------------
+-- Sniffer tap points - plain copies, drive nothing else in this entity.
+-- tap_pll_i/q come from mf_i/q rather than pll_i/q: mf_i/q is the matched
+-- filter's actual input either way the G_PLL generate resolves, where
+-- pll_i/q is only driven inside the G_PLL=true branch and would read 'U' in
+-- simulation with the PLL bypassed.
+------------------------------------------------------------------
+tap_ddc_i     <= ddc_i;
+tap_ddc_q     <= ddc_q;
+tap_ddc_valid <= ddc_valid;
+
+tap_pll_i     <= mf_i;
+tap_pll_q     <= mf_q;
+tap_pll_valid <= mf_valid;
+
+tap_filtered_i     <= filtered_i;
+tap_filtered_q     <= filtered_q;
+tap_filtered_valid <= filtered_valid;
+
+tap_sym_i     <= sym_i;
+tap_sym_q     <= sym_q;
+tap_sym_valid <= sym_valid;
 
 end Behavioral;
