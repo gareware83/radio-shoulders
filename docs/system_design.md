@@ -361,7 +361,7 @@ is answered by `reg_rw_interface` directly from `C_ID_MAGIC` and is deliberately
 *not* also driven through `status_reg` — two sources for one register invites
 drift.
 
-### 4.4 Diagnostic sample capture
+### 4.3 Diagnostic sample capture
 
 A second, much larger address region on the *same* AXI4-Lite bus as the
 registers above — not a second AXI slave, not the DMA. `sample_sniffer.vhd`
@@ -405,7 +405,7 @@ a capture has to run concurrently with a real source — `radioctl loopback`,
 or eventually live traffic — not on its own. See 5.4 for how to run one from
 `radiomon`.
 
-### 4.3 Over-the-air frame format (v1)
+### 4.4 Over-the-air frame format (v1)
 
 ```
 ┌──────────────┬──────────────┬────────────┬─────────────────┬────────────┐
@@ -437,7 +437,7 @@ or eventually live traffic — not on its own. See 5.4 for how to run one from
   **HEADER + PAYLOAD**.
 - Frame types: `0x0` CMD, `0x1` DATA, `0x2` ACK.
 
-### 4.4 DMA packet format (PL → PS)
+### 4.5 DMA packet format (PL → PS)
 
 One AXI-Stream packet per frame, terminated by `TLAST`. The packet is prefixed
 with a **metadata word** so the buffer is self-describing and userspace needs no
@@ -528,7 +528,7 @@ hard-locks the CPU on any access it cannot answer.
 
 | Name | Offset | Access | Meaning |
 |---|---|---|---|
-| `id` | `0x00` | R | `0x5A790001` = expected bitstream; anything else means wrong or unloaded PL |
+| `id` | `0x00` | R | `0x5A790002` = expected bitstream; anything else means wrong or unloaded PL |
 | `control` | `0x04` | R/W | Enable and command pulses |
 | `mode` | `0x08` | R/W | Role and modulation select |
 | `status` | `0x0C` | R | Chain state, driven from PL |
@@ -544,8 +544,8 @@ hard-locks the CPU on any access it cannot answer.
 
 #### Values you can write
 
-**`control` (0x04)** — bits 1 and 3 are write-one pulses that self-clear in the
-PL, so reading them back as 0 is correct behaviour, not a failed write.
+**`control` (0x04)** — bits 1, 3 and 4 are write-one pulses that self-clear in
+the PL, so reading them back as 0 is correct behaviour, not a failed write.
 
 | Bit | Value | Effect |
 |---|---|---|
@@ -553,6 +553,7 @@ PL, so reading them back as 0 is correct behaviour, not a failed write.
 | 1 | `0x2` | `TX_START` — pulse, self-clearing |
 | 2 | `0x4` | `RX_ENABLE` — enables `frame_sync`; low holds it in reset |
 | 3 | `0x8` | `CLR_STATS` — pulse; zeroes counters and quality accumulators |
+| 4 | `0x10` | `CAPTURE_ARM` — pulse; arms the sample sniffer, see 4.3 |
 
 ```bash
 radioctl write control 0x5     # ENABLE + RX_ENABLE   (same as: radioctl listen)
@@ -566,6 +567,7 @@ radioctl write control 0x9     # ENABLE + CLR_STATS   (same as: radioctl clrstat
 | 0 | `0x0` / `0x1` | `ROLE`: 0 = RX, 1 = TX |
 | 3:1 | — | `MOD`, modulation select — reserved, unused |
 | 7:4 | — | `SPREAD`, DSSS factor — reserved, unused |
+| 9:8 | `0x0`–`0x3` | `CAPTURE_TAP`: which RX stage the sniffer captures — `00` DDC, `01` PLL, `10` matched filter, `11` slicer input. See 4.3 |
 
 **`tx_len` (0x10)** — payload bytes, 0–255. Larger values exceed the frame
 format's 8-bit length field.
@@ -574,7 +576,7 @@ format's 8-bit length field.
 
 | Read | Value | Means |
 |---|---|---|
-| `id` | `0x5A790001` | Correct bitstream loaded |
+| `id` | `0x5A790002` | Correct bitstream loaded |
 | `id` | hangs the board | PL unclocked or unprogrammed — see `clk_ignore_unused` in `zybo_work.md` |
 | `id` | anything else | Wrong bitstream |
 | `build` | matches `git rev-parse --short=8 HEAD` | PL was built from this tree |
@@ -595,6 +597,7 @@ format's 8-bit length field.
 | 2 | `FRAME_VALID` | `frame_sync` is past its hunt state |
 | 3 | `OVERFLOW` | A frame was dropped because the buffer was still draining |
 | 4 | `BUILD_DIRTY` | Bitstream built from a tree with uncommitted changes |
+| 5 | `CAPTURE_DONE` | Sample sniffer has filled and frozen; cleared by the next `CAPTURE_ARM` |
 
 `clrstats` resets `frames`, `errors`, `syncs` and the quality accumulators.
 `id` and `build` are constants in fabric and are unaffected.
@@ -680,8 +683,51 @@ It plots the **interval** ratio rather than the registers directly: `qmin` and
 average that converges and then stops responding — useless for watching the
 effect of an adjustment. The difference since the previous poll is what moves.
 
-It maps the register window only and never the DMA, so unlike `radioctl rx` it
-is safe to leave running when the PL's state is uncertain.
+It maps the register window only and never the DMA — including for the
+capture region below, which is a second address range on the *same*
+register bus, not the DMA — so unlike `radioctl rx` it is safe to leave
+running when the PL's state is uncertain.
+
+#### One-shot raw sample capture
+
+```bash
+radiomon --capture <ddc|pll|filtered|sym> [--view constellation|waveform]
+         [--out file.dat] [--capture-timeout ms]
+```
+
+Arms the sniffer at the chosen tap (4.3), waits for `CAPTURE_DONE`, reads all
+1024 words back through the register window, and renders it — a scatter
+constellation by default (I on x, Q on y, one dot per sample: a locked QPSK
+signal shows four tight corner clusters, a spinning or noise-like carrier
+fills the disc — the same signature `qmin`/`qmax` reports as one number, seen
+directly), or `--view waveform` for I/Q vs sample index instead, useful for
+transients and settling behaviour a single snapshot cannot show.
+
+**Needs something else actively driving MM2S at the same time** — `radioctl
+loopback`, or eventually live traffic. There is no free-running ADC in this
+design (`G_VALID_SRC = VALID_DMA`), so a capture run entirely on its own
+times out with nothing to explain why; run it in a second SSH session
+alongside a `loopback` invocation.
+
+`--out file.dat` also writes `I Q` per line — the same two-column convention
+`waveform_generator.py`'s `save_symbols_to_file()` uses, so a hardware
+capture loads straight into that Python tooling as a complex array
+(`I + 1j*Q`) for spectral analysis of real hardware data, not just simulated
+stimulus. Pass `downconvert_fs4=False` to `plot_spectrum()` there — every tap
+point is already downstream of `ddc_fs_4`, so the fs/4 removal has already
+happened in hardware by the time any of them are captured.
+
+**A note on `frame()`/`margin()`, if this file is ever touched again:**
+`radiomon` deliberately never uses them, anywhere. They segfault on this
+toolchain (g++ 11.4.0, confirmed against the pristine upstream `fbbdev/plot`
+source too, not something the header-packing step introduced) — traced as
+far as a self-referential static tree in the vendored library's own Unicode
+width tables reading back corrupted data one level below the root, not
+chased further since it's upstream's bug. Every render path here works
+around it identically: a plain `std::cout` header line, then the
+`BrailleCanvas` streamed directly (it has its own `operator<<`, confirmed not
+to touch the broken code path). Full account in the comment block at the top
+of `plot_lib.hpp` and `radiomon.cpp`.
 
 ### 5.5 RX receive sequence
 
@@ -765,6 +811,7 @@ any stimulus buffer pushed the other way.
 | `dsp-cake/comms_dsp/hdl/` | All PL sources; `system_top.vhd` is the design top |
 | `dsp-cake/comms_dsp/hdl/pkg.vhd` | Register map, frame format, QPSK rotation, CRC |
 | `dsp-cake/comms_dsp/hdl/dsp_pkg.vhd` | RRC taps, DSP-local types |
+| `dsp-cake/comms_dsp/hdl/sample_sniffer.vhd` | Diagnostic capture buffer, see 4.3 |
 | `dsp-cake/comms_dsp/test_bench/` | Testbenches and stimulus |
 | ⤷ `waveform_generator.py` | TX model: framed bursts, impairments, RRC taps |
 | ⤷ `rx_model.py` | Floating-point reference receiver, format self-check |

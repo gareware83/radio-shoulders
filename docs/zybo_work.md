@@ -1150,6 +1150,168 @@ on a 64-bit host, `int` on 32-bit ARM — so template deduction fails only when
 built for the board. The header's top comment records it; reapply it if the file
 is ever re-packed.
 
+### `frame()`/`margin()` segfault in the vendored plot library
+
+Found while building the sniffer's `radiomon --capture` display: **every**
+`radiomon` render path — including the pre-existing continuous quality-trend
+loop from the previous session — crashes the instant it draws a bordered
+frame with a title, on this toolchain (g++ 11.4.0). Confirmed against the
+pristine, un-repacked upstream `fbbdev/plot` source too, so it is not
+something the header-packing step introduced, and it is not new code that
+broke it — `radiomon`'s continuous mode had apparently never actually been
+run to completion before this, only compiled and argument-tested.
+
+Traced with gdb as far as: `frame()`'s title string goes through
+`utf8_string_width()` → `wcwidth()` → `unicode_cp_in_tree()`, which walks a
+large self-referential static `const` tree in `unicode_data.hpp` (Unicode
+east-asian-width data, nodes containing pointers computed as `&array[N]`
+within the array's own initializer). The root node's fields read back
+correctly; the node reached via its first child pointer does not — the
+pointer value itself is right (gdb resolves it to the correct symbol+offset),
+but the memory there holds data that doesn't match the literal source. Smells
+like a codegen/linking issue with that specific pattern on this toolchain,
+not a logic bug reachable from a call site. Not chased further — it's
+upstream's bug, not this project's.
+
+**Fix applied: don't use `frame()`/`margin()` anywhere in `radiomon.cpp`.**
+`BrailleCanvas` has its own `operator<<`, confirmed not to touch the broken
+path — every render is now a plain `std::cout` header line followed by
+streaming the canvas directly. Same braille plotting, no bordered box. Full
+account in the comment blocks at the top of `radiomon.cpp` and
+`plot_lib.hpp` — re-verify this is actually fixed upstream before
+reintroducing `frame()`/`margin()` to this codebase.
+
+## Diagnostic sample sniffer
+
+`sample_sniffer.vhd`, added to answer exactly the kind of question live in
+§0/the DSP Chain section right now: is the DDC or the PLL the reason
+`radioctl loopback` reads `quality 0.417` — without needing to guess from one
+ratio, or add throwaway ILA/debug cores to a design meant to stay clean.
+
+**Single-shot capture, not a scope.** `CONTROL.CAPTURE_ARM` (bit 4, pulse)
+resets the write pointer and starts filling 1024 I/Q pairs from one selected
+RX chain stage; once full, `STATUS.CAPTURE_DONE` (bit 5) sets and the buffer
+freezes until armed again. Same shape as `rx_frame_buffer` — a frozen
+snapshot the PS reads at its own pace has no producer/consumer race to get
+wrong, where a free-running circular buffer would.
+
+**Four tap points**, `MODE.CAPTURE_TAP` (bits 9:8) — post-DDC, post-PLL, post
+matched filter, post-Gardner (the same point `rx_quality` already taps).
+Exposing these needed four new output port groups on `dsp_top` (`tap_ddc_*`,
+`tap_pll_*`, `tap_filtered_*`, `tap_sym_*`) — none of the intermediate
+signals were ports before this. `tap_pll_*` is wired from `mf_i`/`mf_q`, not
+`pll_i`/`pll_q` — the latter are only driven inside `dsp_top`'s `G_PLL=true`
+generate branch and would read `'U'` in simulation with the PLL bypassed;
+`mf_i`/`mf_q` is the matched filter's real input either way.
+
+### Address map: a second region on the same AXI4-Lite bus, not a second slave
+
+Deliberately **not** a new AXI slave + interconnect in the block design.
+`assign_bd_address` dropping the register block at the wrong offset already
+hard-locked this board once (see the address-map section above) — extending
+the *existing*, already-proven `reg_rw_interface` AXI4-Lite slave in VHDL
+only risks a diff-able logic bug, not a repeat of that whole class of
+failure.
+
+`reg_rw_interface`'s `word_index` decode widened from `addr(6 downto 2)` (32
+words) to `addr(12 downto 2)` (2048 words). Below word 256 (`0x400`):
+unchanged control/status flop file, same one-cycle response, same
+documented clamp-to-`C_REG_COUNT-1` gotcha for unimplemented offsets. At or
+above word 256: `sample_sniffer`'s BRAM, clamped to the last valid word the
+same way rather than left undefined.
+
+**The one real complication: BRAM has registered read latency, the flop file
+doesn't.** A new read state, `RD_CAP_WAIT`, holds `rvalid_i` low for exactly
+one extra cycle on capture-region reads — the address and a one-cycle read
+pulse go out to the sniffer while still accepting the AXI address (same
+cycle as the control-region path), then the following cycle latches
+`capture_rd_data` and raises `rvalid_i`. The PS side sees this as ordinary
+AXI4-Lite wait states, not a different protocol — nothing about the
+transaction shape changes, just its latency on this one address range.
+Traced by hand very carefully (this is exactly the class of bug — a
+subtly-wrong AXI handshake — that hard-locks the CPU with no oops and no
+console on this hardware), but **not run through a simulator**, since none
+was available in the environment that wrote it. See "Still open" below.
+
+### `tb_reg_rw_interface.vhd` — rewritten, not extended
+
+The existing testbench predated `status_reg`/`tx_start`/`clr_stats` even
+being ports on `reg_rw_interface` (its port map didn't mention them — would
+not have elaborated against the current entity, capture region or not), and
+its own top comment already called it "chat gpt generated nonsense." Its
+first test wrote `DEADBEEF` to word 0 and asserted the readback matched —
+word 0 is `ID_VERSION`, read-only, always answers `C_ID_MAGIC` regardless of
+what's written there. That assertion cannot pass against the real module.
+
+Rewritten to instantiate `reg_rw_interface` **and** `sample_sniffer`
+together, wired exactly as `system_top.vhd` wires them — the thing actually
+worth verifying is the read-latency contract *between* the two modules, which
+testing `reg_rw_interface` alone with a stubbed `capture_rd_data` would skip
+entirely. Covers: `ID_VERSION` read-only behaviour, `CONTROL`/`MODE`/`TX_LEN`
+round-trip including `WSTRB` partial writes, all three pulse bits
+self-clearing, the control-region gap clamp, and — the real target — arm the
+sniffer on the `sym` tap, feed all 1024 samples, wait for `CAPTURE_DONE`,
+read every word back through AXI and check it round-tripped exactly, plus
+the overrun-clamps-to-last-word case.
+
+Runs at the **real production capture depth (1024)**, not a scaled-down
+generic override. A smaller override was tried first for faster simulation,
+and would have been a live latent bug: `reg_rw_interface`'s capture-region
+clamp is hardcoded to the *package* constant `C_CAPTURE_DEPTH`, not to
+whatever depth the instantiated `sample_sniffer` actually has — true by
+construction in production (both derive from the same constant with no
+override), but a testbench-only smaller depth would have silently driven an
+out-of-range value into `rd_addr`'s `natural range 0 to G_DEPTH-1` port. Real
+finding, real fix (just don't override it — 1024 cycles costs nothing in
+simulated or wall-clock time), but worth remembering if this depth is ever
+made genuinely configurable: `reg_rw_interface` and `sample_sniffer` would
+need to agree on it explicitly, not just by sharing a default.
+
+### `ID_MAGIC` bumped `0x5A79_0001` → `0x5A79_0002`
+
+Per the convention already in `pkg.vhd`'s own comment ("bump the low half on
+register map changes") — new `CONTROL`/`MODE`/`STATUS` bits plus the whole
+capture address region are new since the last bump. Updated in all three
+places this project keeps independent copies by its own established
+convention (`pkg.vhd`, `radioctl.c`, `radiomon`'s `radio_regs.h` — not a
+shared header between the two C/C++ tools, checked and confirmed that's the
+existing pattern before following it). An old `radioctl`/`radiomon` against
+this bitstream is unaffected (never touches the new bits); new tools against
+an *old* bitstream would have read the capture region as clamped
+control-register garbage rather than real samples — wrong, not a hang, but
+worth the id check catching outright.
+
+### Software side
+
+`radioctl.c` and `radiomon`'s `radio_regs.h` both got the new
+`CTRL_CAPTURE_ARM`/`STAT_CAPTURE_DONE`/`MODE_CAPTURE_TAP_*` constants.
+`radiomon --capture <tap>` is the actual readout path (see
+system_design.md §5.4) — arms, polls `CAPTURE_DONE`, reads all 1024 words
+through the same UIO mapping `radiomon` already holds open for the quality
+loop (the capture region is on that same register bus, so this doesn't
+touch DMA and doesn't add risk to "safe to leave running"), and renders a
+constellation scatter or an I/Q waveform trace. `--out file.dat` writes the
+same `I Q` two-column format `waveform_generator.py` already uses for
+symbols, so a real hardware capture can be fed straight into the PSD tooling
+built earlier this session.
+
+Verified without hardware: full round-trip through a synthetic register
+file (`MODE.CAPTURE_TAP` bit-packing, `STATUS.CAPTURE_DONE` polling and
+timeout, I/Q sign-extension out of the packed 32-bit word, file save/reload,
+both plot views rendering without crashing on realistic data shapes). Not
+verified: the real hardware read-latency path this was all built to test in
+the first place — that needs the board.
+
+### Still open
+
+- **Nothing above has touched Vivado, GHDL, or hardware.** Run
+  `tb_reg_rw_interface.vhd` in an actual simulator before the next bitstream
+  build — the AXI wait-state FSM is exactly the class of change that hard-hangs
+  this board when subtly wrong, and manual tracing is not the same as a
+  simulator agreeing.
+- The live DDC-vs-PLL question the sniffer exists to help answer is still
+  open — see §0.
+
 ## Boot script, rootfs updates, and build identification
 
 ### `boot.scr` is now generated by the build — and the drift it was hiding
@@ -1264,19 +1426,18 @@ Live state at the end of the last working session. Nothing here is settled.
 
 ### 0. State of the board and tree right now
 
-The Vivado project **has** been regenerated from `create_project.tcl` and rebuilt to a bitstream (`vivado.log`, `launch_runs` through `write_bitstream`, copied to the repo root and `board/common/zybo_radio.bit`), and `fit.itb` was rebuilt afterwards, so the FIT carries it. That was the previous "next action" and it is done at the build level. The pinned `0x43C0_0000`, the fatal address-map check, `latest_ipdef`, the manual interconnect wiring and `build_id.vhd` generation all survived a real run.
+**Confirmed on hardware:** `BUILD_ID` matches the tree the 40 MHz bitstream was actually built from, and Vivado reports timing met at 40 MHz (positive `WNS`, replacing the earlier `-1.017 ns` at 50 MHz — see "Timing" in the status list below). The loopback demo ran on real hardware for the first time this session too, surfacing the current live bug: `radioctl loopback ddc_input.dat` reports `quality 0.417` (the "no carrier structure" value — matches both a spinning constellation and noise, see the DSP Chain section) and zero frames/syncs. `probe_const.dat` (§ "RX Loopback Demo") exists specifically to bisect DDC vs PLL on this and has not been run yet.
 
-What is still out of step:
+**New, unbuilt, unbooted:** a diagnostic sample sniffer (`sample_sniffer.vhd` + changes to `pkg.vhd`/`reg_rw_interface.vhd`/`dsp_top.vhd`/`system_top.vhd`), built specifically to make that bisect (and future DSP debugging generally) direct instead of inferred from one ratio — see the "Diagnostic sample sniffer" section below for the full design. **None of it has been through Vivado, GHDL, or hardware yet** — no GHDL was available in the environment that wrote it, so verification so far is: careful manual trace of the new AXI wait-state FSM, a rewritten `tb_reg_rw_interface.vhd` (needs an actual simulator run), and full compiles of the C/C++ side including a synthetic-data functional test. `ID_MAGIC` was bumped `...0001` → `...0002` for the register map change, so a stale board will visibly disagree with new `radioctl`/`radiomon` rather than silently misbehave.
 
 | Thing | State | Consequence |
 |---|---|---|
-| Everything above | Built, **never booted** | None of it is proven in hardware yet, only in the tool |
-| FCLK0 | Changed 50 → 40 MHz in both the tcl and the dts | Needs a Vivado rebuild *and* a Buildroot rebuild; the two must land together |
-| `BUILD_ID` in the built bitstream | `0x0e03d0a8`, which **is not a commit in this repo** | The workspace move rewrote history. `BUILD_DIRTY` is set so it was only ever a lower bound, but regenerate `build_id.vhd` before the next build or `radioctl read build` names a commit that does not exist |
-| `radioctl` / `radiomon` on the board | Rebuilt into `output-zybo/target/`, not yet onto the card | Needs an image rebuild and the rootfs update dance below |
+| Sniffer RTL | Written, never simulated or synthesized | **Run `tb_reg_rw_interface.vhd` before flashing** — it now covers the capture-region read-latency path end to end, not just the control registers |
+| `sample_sniffer.vhd` | New file | Picked up automatically by `create_project.tcl`'s `glob $hdl_dir/*.vhd`, no script edit needed |
+| `radioctl`/`radiomon` | Rebuilt into `output-zybo/target/` (constants mirror, `ID_MAGIC` bump, capture readout) | Needs an image rebuild and the rootfs update dance below |
 | `clk_ignore_unused` | In both `boot.cmd` files | Confirm the `boot.scr` on the FAT partition was regenerated; otherwise it only applies when typed by hand at the U-Boot prompt |
 
-**Next action:** rebuild the bitstream at 40 MHz, confirm `WNS` is now positive, then rebuild the images and update the rootfs. After that the loopback demo is runnable end to end for the first time.
+**Next action:** run `tb_reg_rw_interface.vhd` in simulation (GHDL or Vivado xsim — neither was available where this was written). If it passes, rebuild the bitstream, confirm `radioctl read build`/`STATUS.BUILD_DIRTY` and `radioctl dump`'s `id` line read as expected (the magic bump means a stale board will say so explicitly), then run `probe_const.dat` through `radioctl loopback` to finally answer DDC-vs-PLL — and now the sniffer gives a second, direct way to answer the same question if the probe result is ambiguous: `radiomon --capture ddc` and `--capture pll` during a loopback run should show a static point (correct) or a rotating/scattered cloud (broken) at whichever stage is actually at fault.
 
 Avoid another hand edit to the BD: the script is the source of truth and has now proven it can rebuild the design.
 
@@ -1361,6 +1522,8 @@ They are independent because boot uses mainline U-Boot's bundled `ps7_init_gpl.c
 
 Vivado emits a bitstream even when timing fails; it is only a critical warning. Confirm `WNS` is positive on the next rebuild rather than assuming the clock change took.
 
+**Confirmed: `WNS` is now positive at 40 MHz**, checked directly in Vivado after the rebuild. Timing is settled; the current live problem (§0, DSP Chain section) is entirely a DSP-correctness question now, not a clocking one.
+
 ### 5. Repo split
 
 Work is moving to `radio-shoulders` (flattened single repo; nested `dsp-cake` and `zybo-br-tree` `.git` dirs removed). `zybo_NEW` retains the originals including the `gareware83/dsp-cake` remote.
@@ -1387,7 +1550,7 @@ Watch the output trees: they are named `output/`, `output-zybo/` and `output-pyn
   - [x] Two convention bugs found by the Python reference model before RTL sim: preamble mapping to a constant symbol, and `ddc_fs_4` producing conjugate baseband
   - [x] Bit-truth self-checking testbench (compares every S2MM beat against transmitted payload)
   - [x] Lock-quality metric (`rx_quality.vhd`) + `sync_count`, readable from the PS
-  - [~] **RX chain does not yet recover frames in simulation** — sync fires, CRC fails. See "Where things stand".
+  - [~] **RX chain does not yet recover frames on hardware** — `radioctl loopback` reads `quality 0.417` (no carrier structure), zero frames/syncs. `probe_const.dat` exists to bisect DDC vs PLL; not yet run. See "Where things stand".
   - [ ] Farrow interpolator / polyphase timing recovery — deferred to a standalone project
   - [ ] Automatic loop tuner — metric built, coefficient registers deliberately not yet added
 - [x] **PL register window pinned to `0x43C0_0000`** with a build-time check — an unpinned `assign_bd_address` put it at `0x4000_0000` and hard-locked the CPU on every register access
@@ -1396,12 +1559,13 @@ Watch the output trees: they are named `output/`, `output-zybo/` and `output-pyn
 - [x] `BUILD_ID` + `STATUS.BUILD_DIRTY` so a running board reports which commit its bitstream came from
 - [x] NTP (busybox `ntpd`) against the dev host on both boards — no RTC on either
 - [x] **`clk_ignore_unused` in bootargs** — without it FCLK0 is gated off after boot, the PL runs unclocked, and any register access hard-locks the CPU
-- [~] **Timing**: was WNS −1.017 ns on 96 endpoints in the matched filter's DSP cascade, at a constraint that turned out to be correct all along (50 MHz, matching the dts). FCLK0 dropped to 40 MHz in both the tcl and the dts; **rebuild and confirm WNS is positive**. Pipelining the filter MAC is the proper fix and is still open
-- [x] **RX loopback demo**: `radioctl loopback` plays a sample file through DDR → MM2S → RX chain → S2MM → DDR and checks every beat against the transmitted payload. One transfer per frame, boundaries from `rx_chunks.txt`, because the single frame buffer backpressures and a 3 µs gap is not re-armable from userspace. Built and host-tested; **not yet run on hardware**
-- [x] `radiomon` — live terminal plot of the lock-quality ratio + counters, register window only. Cross-compiles for the board (needed one 32-bit fix in the vendored plot library)
+- [x] **Timing**: was WNS −1.017 ns on 96 endpoints in the matched filter's DSP cascade, at a constraint that turned out to be correct all along (50 MHz, matching the dts). FCLK0 dropped to 40 MHz in both the tcl and the dts; **confirmed WNS positive in Vivado on hardware rebuild**. Pipelining the filter MAC would still be the more headroom-generous fix, not currently planned
+- [x] **RX loopback demo**: `radioctl loopback` plays a sample file through DDR → MM2S → RX chain → S2MM → DDR and checks every beat against the transmitted payload. One transfer per frame, boundaries from `rx_chunks.txt`, because the single frame buffer backpressures and a 3 µs gap is not re-armable from userspace. **Run on hardware** — surfaced the current live bug (quality 0.417, see above) rather than confirming a working RX chain
+- [x] `radiomon` — live terminal plot of the lock-quality ratio + counters, register window only. Cross-compiles for the board (needed one 32-bit fix in the vendored plot library). `frame()`/`margin()` in the vendored plot library segfault on this toolchain (confirmed upstream too) — every render path rewritten to bypass them; see "Diagnostic sample sniffer"
+- [~] **Diagnostic sample sniffer** (`sample_sniffer.vhd`) — single-shot capture buffer, 4 selectable RX-chain tap points, exposed as a second address region on the existing register AXI4-Lite bus (not a new slave), read via `radiomon --capture <tap>`. RTL + software written and cross-compiled; `tb_reg_rw_interface.vhd` rewritten to cover the new AXI wait-state path end to end. **Not yet run through any simulator or on hardware** — no GHDL available where this was built. `ID_MAGIC` bumped `...0001`→`...0002` for the register map change
 - [ ] CI joining the Vivado and Buildroot builds (bitstream → `board/common/` → FIT is currently a manual step)
 - [x] **PL/PS plumbing live on hardware** — AXI DMA probes at `0x8040_0000`, `/dev/uio0` maps the register window at `0x43C0_0000`, FPGA manager present at `/sys/class/fpga_manager/fpga0`
-- [x] Register control path end-to-end, **verified on hardware** — rebuilt `reg_rw_interface` (real address decode, RO/RW split, pulse bits) + `radioctl` in the rootfs. `id` reads `0x5A790001`, RW registers round-trip (`mode`, `tx_len`), `tx_start` self-clears after `transmit`.
+- [x] Register control path end-to-end, **verified on hardware** — rebuilt `reg_rw_interface` (real address decode, RO/RW split, pulse bits) + `radioctl` in the rootfs. `id` reads `0x5A790002` (bumped for the sniffer's register-map change), RW registers round-trip (`mode`, `tx_len`), `tx_start` self-clears after `transmit`.
 - [ ] TX/RX chains driving the registers — `status_reg` is tied to zeros in `system_top.vhd` until they do
 - [ ] PS-side software for the datapath — `dma_proxy` (or hand-rolled UIO DMA) not started
 - [ ] Ethernet-based radio comms between the two boards — not started

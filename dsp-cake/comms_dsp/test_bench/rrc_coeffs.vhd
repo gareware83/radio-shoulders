@@ -5,6 +5,7 @@
 -- Regenerate alongside the stimulus - they are only matched
 -- if they come from the same RRC definition.
 constant FILTER_LEN : integer := 9;
+
 constant rrc_coeffs : coeff_array_t := (
     to_signed(   854, 16),
     to_signed( -2021, 16),

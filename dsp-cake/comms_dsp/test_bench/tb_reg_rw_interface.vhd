@@ -85,85 +85,110 @@ architecture sim of tb_reg_rw_interface is
   -- AXI4-Lite master procedures
   ------------------------------------------------------------------------
   procedure axi_write(addr : in std_logic_vector(31 downto 0);
-                      data : in std_logic_vector(31 downto 0);
-                      strb : in std_logic_vector(3 downto 0)) is
+                    data : in std_logic_vector(31 downto 0);
+                    strb : in std_logic_vector(3 downto 0);
+                    signal awaddr_o  : out   std_logic_vector(31 downto 0);
+                    signal awprot_o  : out   std_logic_vector(2 downto 0);
+                    signal awvalid_o : inout std_logic;
+                    signal awready_i : in    std_logic;
+                    signal wdata_o   : out   std_logic_vector(31 downto 0);
+                    signal wstrb_o   : out   std_logic_vector(3 downto 0);
+                    signal wvalid_o  : inout std_logic;
+                    signal wready_i  : in    std_logic;
+                    signal bready_o  : out   std_logic;
+                    signal bvalid_i  : in    std_logic;
+                    signal bresp_i   : in    std_logic_vector(1 downto 0)) is
     variable aw_done, w_done : boolean := false;
     variable timeout         : natural := 0;
-  begin
-    AWADDR <= addr; 
-    AWPROT <= (others => '0');
-    WDATA  <= data; 
-    WSTRB  <= strb;
-    AWVALID <= '1';
-     WVALID <= '1';
+begin
+    awaddr_o  <= addr;
+    awprot_o  <= (others => '0');
+    wdata_o   <= data;
+    wstrb_o   <= strb;
+    awvalid_o <= '1';
+    wvalid_o  <= '1';
 
     while not (aw_done and w_done) loop
-      wait until rising_edge(clk);
-      if AWVALID = '1' and AWREADY = '1' then
-        AWVALID <= '0'; 
-        aw_done := true;
-      end if;
-      if WVALID = '1' and WREADY = '1' then
-        WVALID <= '0'; 
-        w_done := true;
-      end if;
-      timeout := timeout + 1;
-      assert timeout < C_TIMEOUT_CYC
-        report "AXI write address/data handshake timeout" severity failure;
+        wait until rising_edge(clk);
+        if awvalid_o = '1' and awready_i = '1' then
+            awvalid_o <= '0';
+            aw_done := true;
+        end if;
+        if wvalid_o = '1' and wready_i = '1' then
+            wvalid_o <= '0';
+            w_done := true;
+        end if;
+        timeout := timeout + 1;
+        assert timeout < C_TIMEOUT_CYC
+            report "AXI write address/data handshake timeout" severity failure;
     end loop;
 
-    BREADY <= '1';
+    bready_o <= '1';
     timeout := 0;
     loop
-      wait until rising_edge(clk);
-      exit when BVALID = '1';
-      timeout := timeout + 1;
-      assert timeout < C_TIMEOUT_CYC
-        report "AXI write response timeout" severity failure;
+        wait until rising_edge(clk);
+        exit when bvalid_i = '1';
+        timeout := timeout + 1;
+        assert timeout < C_TIMEOUT_CYC
+            report "AXI write response timeout" severity failure;
     end loop;
-    assert BRESP = "00" report "Write BRESP not OKAY" severity error;
-    BREADY <= '0';
-  end procedure;
+    assert bresp_i = "00" report "Write BRESP not OKAY" severity error;
+    bready_o <= '0';
+end procedure;
+
 
   procedure axi_read(addr : in  std_logic_vector(31 downto 0);
-                     data : out std_logic_vector(31 downto 0)) is
+                   data : out std_logic_vector(31 downto 0);
+                   signal araddr_o  : out   std_logic_vector(31 downto 0);
+                   signal arprot_o  : out   std_logic_vector(2 downto 0);
+                   signal arvalid_o : inout std_logic;
+                   signal arready_i : in    std_logic;
+                   signal rready_o  : out   std_logic;
+                   signal rvalid_i  : in    std_logic;
+                   signal rdata_i   : in    std_logic_vector(31 downto 0);
+                   signal rresp_i   : in    std_logic_vector(1 downto 0)) is
     variable timeout : natural := 0;
-  begin
-    ARADDR <= addr; ARPROT <= (others => '0');
-    ARVALID <= '1';
+begin
+    araddr_o  <= addr;
+    arprot_o  <= (others => '0');
+    arvalid_o <= '1';
     loop
-      wait until rising_edge(clk);
-      exit when ARVALID = '1' and ARREADY = '1';
-      timeout := timeout + 1;
-      assert timeout < C_TIMEOUT_CYC
-        report "AXI read address handshake timeout" severity failure;
+        wait until rising_edge(clk);
+        exit when arvalid_o = '1' and arready_i = '1';
+        timeout := timeout + 1;
+        assert timeout < C_TIMEOUT_CYC
+            report "AXI read address handshake timeout" severity failure;
     end loop;
-    ARVALID <= '0';
+    arvalid_o <= '0';
 
-    RREADY <= '1';
+    rready_o <= '1';
     timeout := 0;
     loop
-      wait until rising_edge(clk);
-      exit when RVALID = '1';
-      timeout := timeout + 1;
-      assert timeout < C_TIMEOUT_CYC
-        report "AXI read data timeout" severity failure;
+        wait until rising_edge(clk);
+        exit when rvalid_i = '1';
+        timeout := timeout + 1;
+        assert timeout < C_TIMEOUT_CYC
+            report "AXI read data timeout" severity failure;
     end loop;
-    data := RDATA;
-    assert RRESP = "00" report "Read RRESP not OKAY" severity error;
-    RREADY <= '0';
-  end procedure;
+    data := rdata_i;
+    assert rresp_i = "00" report "Read RRESP not OKAY" severity error;
+    rready_o <= '0';
+end procedure;
+
 
   -- One clock of a tap sample with valid asserted - models what a real DSP
   -- stage would do, one sample per pulse.
-  procedure feed_sym(i, q : in integer) is
-  begin
-    sym_i <= to_signed(i, 16);
-    sym_q <= to_signed(q, 16);
-    sym_valid <= '1';
+  procedure feed_sym(i, q : in integer;
+                   signal sym_i_o     : out signed(15 downto 0);
+                   signal sym_q_o     : out signed(15 downto 0);
+                   signal sym_valid_o : out std_logic) is
+begin
+    sym_i_o     <= to_signed(i, 16);
+    sym_q_o     <= to_signed(q, 16);
+    sym_valid_o <= '1';
     wait until rising_edge(clk);
-    sym_valid <= '0';
-  end procedure;
+    sym_valid_o <= '0';
+end procedure;
 
 begin
 
@@ -210,10 +235,18 @@ begin
       clk => clk,
       rst => rst,
 
-      ddc_i => ddc_i, ddc_q => ddc_q, ddc_valid => ddc_valid,
-      pll_i => pll_i, pll_q => pll_q, pll_valid => pll_valid,
-      filtered_i => filt_i, filtered_q => filt_q, filtered_valid => filt_valid,
-      sym_i => sym_i, sym_q => sym_q, sym_valid => sym_valid,
+      ddc_i          => ddc_i,
+      ddc_q          => ddc_q, 
+      ddc_valid      => ddc_valid,
+      pll_i          => pll_i, 
+      pll_q          => pll_q,
+      pll_valid      => pll_valid,
+      filtered_i     => filt_i, 
+      filtered_q     => filt_q, 
+      filtered_valid => filt_valid,
+      sym_i => sym_i, 
+      sym_q => sym_q, 
+      sym_valid => sym_valid,
 
       tap_sel => fpga_reg(C_REG_MODE)(C_MODE_CAPTURE_TAP_RANGE),
 
@@ -251,27 +284,47 @@ begin
     -- 1) ID_VERSION is read-only: a write is discarded, the read always
     --    answers C_ID_MAGIC regardless.
     -----------------------------------------------------------------
-    axi_write(x"00000000", x"DEADBEEF", "1111");
-    axi_read (x"00000000", rd);
+    axi_write(x"00000000", x"DEADBEEF", "1111",
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
+    axi_read (x"00000000", rd,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
     assert rd = C_ID_MAGIC
       report "ID_VERSION did not read back C_ID_MAGIC" severity failure;
 
     -----------------------------------------------------------------
     -- 2) CONTROL/MODE/TX_LEN are genuinely read/write, and round-trip.
     -----------------------------------------------------------------
-    axi_write(x"00000008", x"00000001", "1111");   -- MODE, word 2
-    axi_read (x"00000008", rd);
+    axi_write(x"00000008", x"00000001", "1111",   -- MODE, word 2
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
+    axi_read (x"00000008", rd,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
     assert rd = x"00000001" report "MODE readback mismatch" severity failure;
 
-    axi_write(x"00000010", x"000000AA", "1111");   -- TX_LEN, word 4
-    axi_read (x"00000010", rd);
+    axi_write(x"00000010", x"000000AA", "1111",   -- TX_LEN, word 4
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
+    axi_read (x"00000010", rd,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
     assert rd = x"000000AA" report "TX_LEN readback mismatch" severity failure;
 
     -- WSTRB: strobe "0001" touches only byte 0. Previous value was
     -- 0x000000AA; writing 0xFFFFFF55 with byte 0 alone selected should leave
     -- bytes 1-3 at their old value (all zero) and replace only byte 0 (0x55).
-    axi_write(x"00000010", x"FFFFFF55", "0001");
-    axi_read (x"00000010", rd);
+    axi_write(x"00000010", x"FFFFFF55", "0001",
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
+    axi_read (x"00000010", rd,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
     assert rd = x"00000055"
       report "WSTRB byte-0-only write touched bytes it should not have"
       severity failure;
@@ -284,8 +337,13 @@ begin
     --    below), but the stored bit reads back 0, not 1.
     -----------------------------------------------------------------
     -- ENABLE(0) | TX_START(1) | CLR_STATS(3) | CAPTURE_ARM(4) = 0b11011
-    axi_write(x"00000004", x"0000001B", "1111");
-    axi_read (x"00000004", rd);
+    axi_write(x"00000004", x"0000001B", "1111",
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
+    axi_read (x"00000004", rd,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
     assert rd(C_CTRL_TX_START) = '0'
       report "TX_START did not self-clear" severity failure;
     assert rd(C_CTRL_CLR_STATS) = '0'
@@ -302,8 +360,12 @@ begin
     --    comment, still true after widening the decode for the capture
     --    region. Word 40 is comfortably inside the gap (13 <= 40 < 256).
     -----------------------------------------------------------------
-    axi_read (std_logic_vector(to_unsigned(C_REG_BUILD_ID * 4, 32)), exp);
-    axi_read (std_logic_vector(to_unsigned(40 * 4, 32)), rd);
+    axi_read (std_logic_vector(to_unsigned(C_REG_BUILD_ID * 4, 32)), exp,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
+    axi_read (std_logic_vector(to_unsigned(40 * 4, 32)), rd,
+             ARADDR, ARPROT, ARVALID, ARREADY,
+             RREADY, RVALID, RDATA, RRESP);
     assert rd = exp
       report "control-region gap did not clamp to the last register"
       severity failure;
@@ -315,14 +377,20 @@ begin
     --    the read-latency path (RD_CAP_WAIT) actually being exercised
     --    end-to-end, not just reasoned about.
     -----------------------------------------------------------------
-    axi_write(x"00000008", x"00000300", "1111");  -- MODE.CAPTURE_TAP = "11" (SYM)
-    axi_write(x"00000004", x"00000011", "1111");  -- ENABLE | CAPTURE_ARM
+    axi_write(x"00000008", x"00000300", "1111",  -- MODE.CAPTURE_TAP = "11" (SYM)
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
+    axi_write(x"00000004", x"00000011", "1111",  -- ENABLE | CAPTURE_ARM
+             AWADDR, AWPROT, AWVALID, AWREADY,
+             WDATA, WSTRB, WVALID, WREADY,
+             BREADY, BVALID, BRESP);
 
     -- CAPTURE_ARM took effect on the write above; sample_sniffer is now
     -- "filling". Feed exactly C_CAPTURE_DEPTH samples, each i=n, q=-n so I and
     -- Q are distinguishable in the readback.
     for n in 0 to C_CAPTURE_DEPTH - 1 loop
-      feed_sym(n, -n);
+      feed_sym(n, -n, sym_i, sym_q, sym_valid);
     end loop;
 
     timeout := 0;
@@ -334,7 +402,9 @@ begin
     end loop;
 
     for n in 0 to C_CAPTURE_DEPTH - 1 loop
-      axi_read(std_logic_vector(to_unsigned((256 + n) * 4, 32)), rd);
+      axi_read(std_logic_vector(to_unsigned((256 + n) * 4, 32)), rd,
+              ARADDR, ARPROT, ARVALID, ARREADY,
+              RREADY, RVALID, RDATA, RRESP);
       exp := std_logic_vector(to_signed(-n, 16)) & std_logic_vector(to_signed(n, 16));
       assert rd = exp
         report "capture word " & integer'image(n) & " mismatch: got " &
@@ -346,8 +416,12 @@ begin
     -- 6) Reading past the capture depth clamps to the last word, same
     --    "defined behaviour instead of a gap" rule as the control region.
     -----------------------------------------------------------------
-    axi_read(std_logic_vector(to_unsigned((256 + C_CAPTURE_DEPTH - 1) * 4, 32)), exp);
-    axi_read(std_logic_vector(to_unsigned((256 + C_CAPTURE_DEPTH + 5) * 4, 32)), rd);
+    axi_read(std_logic_vector(to_unsigned((256 + C_CAPTURE_DEPTH - 1) * 4, 32)), exp,
+            ARADDR, ARPROT, ARVALID, ARREADY,
+            RREADY, RVALID, RDATA, RRESP);
+    axi_read(std_logic_vector(to_unsigned((256 + C_CAPTURE_DEPTH + 5) * 4, 32)), rd,
+            ARADDR, ARPROT, ARVALID, ARREADY,
+            RREADY, RVALID, RDATA, RRESP);
     assert rd = exp
       report "capture-region overrun did not clamp to the last word"
       severity failure;
