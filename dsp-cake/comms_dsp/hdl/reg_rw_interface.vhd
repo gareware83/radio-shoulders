@@ -102,7 +102,7 @@ architecture rtl of reg_rw_interface is
     -- one extra cycle the capture region's BRAM read needs before its data is
     -- valid. The control region never enters RD_CAP_WAIT - its response is
     -- still exactly as fast as before this region existed.
-    type rd_state_t is (RD_IDLE, RD_CAP_WAIT);
+    type rd_state_t is (RD_IDLE, RD_CAP_WAIT, RD_CAP_WAIT1);
     signal rd_state : rd_state_t := RD_IDLE;
 
     -- Word index from a byte address, over the FULL address space (both
@@ -335,8 +335,15 @@ begin
                                 rd_state          <= RD_CAP_WAIT;
                             end if;
                         end if;
+                    when RD_CAP_WAIT => 
+                        -- The BRAM captures capture_rd_addr_i/capture_rd_en_i (stable since
+                        -- last cycle) AT this edge; its registered output isn't valid until
+                        -- the FOLLOWING edge (READ_LATENCY_B => 1). Nothing to do but wait
+                        -- one more cycle for it.
+                    
+                        rd_state <= RD_CAP_WAIT1;
 
-                    when RD_CAP_WAIT =>
+                    when RD_CAP_WAIT1 =>
                         rdata_i  <= capture_rd_data;
                         rvalid_i <= '1';
                         rd_state <= RD_IDLE;
