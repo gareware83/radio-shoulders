@@ -50,7 +50,7 @@ entity sample_sniffer is
         ddc_q      : in signed(15 downto 0);
         ddc_valid  : in std_logic;
 
-        pll_i      : in signed(15 downto 0);   -- post-PLL (dsp_top's mf_i/q)
+        pll_i      : in signed(15 downto 0);   -- post-PLL (dsp_top's sym_i/q)
         pll_q      : in signed(15 downto 0);
         pll_valid  : in std_logic;
 

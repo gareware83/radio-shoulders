@@ -47,9 +47,34 @@ END COMPONENT;
 -- Raising C_GAIN_FRAC slows the loop and increases headroom; lowering it
 -- speeds acquisition and risks instability. Tune this rather than letting the
 -- arithmetic overflow.
+--
+-- Designed by test_bench/loop_model.py (Bn*Ts=0.001, zeta=0.707) from the
+-- FIXED detector's measured Kd - not the untuned placeholders these replace.
+-- loopf_proc's structure (u accumulates K1*e[n]+K2*e[n-1] directly, no
+-- separate integral accumulator) is NOT the textbook Kp/Ki topology; see
+-- pll_kp_ki_to_rtl()'s docstring for the K1=Kp+Ki, K2=-Kp mapping used to
+-- get here. Regenerate with loop_model.py rather than hand-tuning either
+-- value on its own - they only make sense as this specific pair.
+--
+-- SIGN: this pd_proc rotates the input FORWARD by theta_nco
+-- (psi = phi_in + theta_nco), not the standard DEROTATION
+-- (psi = phi_in - theta_nco) closed-form PLL design formulas assume - see
+-- pll_phase_detector()'s and characterize_pll_detector()'s docstrings in
+-- loop_model.py. Missing that sign once already shipped a K1/K2 pair that
+-- passed every dead-zone/margin check yet was pure POSITIVE feedback in the
+-- real closed loop - confirmed by run_pll_pure_tone(), a single-tone
+-- closed-loop test with no data modulation at all: phase_err oscillated
+-- continuously across virtually the full detector range (RMS ~6.5e8)
+-- regardless of loop bandwidth, damping factor, or step-size clamping,
+-- because none of those fix a sign error. Negating BOTH K1 and K2 (this
+-- pair) collapsed that to phase_err RMS ~58k - an ~11,000x reduction - with
+-- u landing within 0.01% of the correct value. loop_model.py's
+-- characterize_pll_detector() now negates its measured Kd before this
+-- design is derived, so a straight regenerate keeps the right sign
+-- automatically - this comment is here so it's obvious if it ever isn't.
 constant C_GAIN_FRAC : natural := 16;
-constant K1 : signed(15 downto 0) := to_signed(105,16);
-constant K2 : signed(15 downto 0) := to_signed(1,16);
+constant K1 : signed(15 downto 0) := to_signed(-810,16);
+constant K2 : signed(15 downto 0) := to_signed(803,16);
 
 -- Widths: K (16) * phase_err (32) = 48-bit product; summing two needs 49.
 constant C_PROD_W : natural := K1'length + 32;   -- 48
@@ -92,7 +117,6 @@ signal quadrant_d       : unsigned(1 downto 0)         := (others => '0');
 -- Phase detector
 ------------------------------------------------------------------
 signal I_rot, Q_rot    : signed(15 downto 0) := (others => '0');
-signal I_Q_rot,Q_I_rot : signed(63 downto 0) := (others => '0');
 signal phase_err       : signed(31 downto 0) := (others => '0');
  
 ------------------------------------------------------------------
@@ -207,29 +231,65 @@ port map (
         );
 */
     ------------------------------------------------------------------
-    -- Phase detector (multiply input by NCO, compute cross product)
+    -- Phase detector: rotate input by the NCO estimate, then a
+    -- decision-directed cross product on the ROTATED sample.
     ------------------------------------------------------------------
+-- The previous version crossed the RAW, un-rotated I_in/Q_in against the
+-- rotated pair: phase_err <= I_in*Q_rot - Q_in*I_rot. Algebraically, with
+-- I_rot/Q_rot themselves defined as I_in/Q_in rotated by theta (the NCO's
+-- own phase), that cross product collapses to exactly
+-- (I_in^2 + Q_in^2) * sin(theta) - a term that depends on the NCO's OWN
+-- phase and the input's magnitude, but never on the input's actual phase.
+-- It could not detect a phase error at all, confirmed numerically in
+-- test_bench/loop_model.py (characterize_pll_detector(): sweeping the
+-- input's phase at fixed NCO phase gave zero response; sweeping the NCO's
+-- phase alone reproduced a full sin curve - the two sweeps should have
+-- looked similar for a genuine phase detector, and instead only one of them
+-- did anything).
+--
+-- Fixed to the decision-directed form the old code's own comment named but
+-- didn't implement: e = sign(I_rot)*Q_rot - sign(Q_rot)*I_rot. For a
+-- correctly-decided QPSK symbol this is proportional to sin(residual phase
+-- error) and invariant to which of the four constellation points is
+-- currently transmitted - the hard decision (which quadrant) supplies the
+-- right reference point automatically, so the error reflects only how far
+-- off that decided point the sample landed, not the data itself. No
+-- multiplier needed for the "sign(...)" part - just a conditional negate on
+-- the sign bit.
 pd_proc: process(clk)
-    variable multI, multQ : signed(31 downto 0) := (others => '0');
+    variable multI, multQ       : signed(31 downto 0) := (others => '0');
+    variable signed_I, signed_Q : signed(31 downto 0) := (others => '0');
 begin
     if rst = '1' then
         I_rot     <= (others => '0');
-        Q_rot     <= (others => '0'); 
-        I_Q_rot   <= (others => '0');
-        Q_I_rot   <= (others => '0');   
-        phase_err <= (others => '0');    
+        Q_rot     <= (others => '0');
+        phase_err <= (others => '0');
     elsif rising_edge(clk) and data_valid = '1'  then
-        -- rotate input by NCO
+        -- rotate input by NCO - this part was always correct; only the
+        -- error formula below it wasn't.
         multI := resize((resize(I_in,32) * resize(nco_cos,32) - resize(Q_in,32) * resize(nco_sin,32)),32);
         multQ := resize((resize(I_in,32) * resize(nco_sin,32) + resize(Q_in,32) * resize(nco_cos,32)),32);
 
         I_rot <= resize(multI(31 downto 16),16);
         Q_rot <= resize(multQ(31 downto 16),16);
 
-        I_Q_rot <= resize(I_in,32) * resize(Q_rot,32);
-        Q_I_rot <= resize(Q_in,32) * resize(I_rot,32);
-        -- decision-directed phase detector (I*Q' - Q*I')
-        phase_err <= resize(resize(I_Q_rot,32) - resize(Q_I_rot,32),32);
+        -- Uses multI/multQ (this cycle's fresh rotation) rather than the
+        -- registered I_rot/Q_rot, which would read one cycle stale here -
+        -- no reason to carry that staleness into a formula being fixed
+        -- anyway.
+        if multI(31) = '0' then
+            signed_Q := resize(multQ, 32);
+        else
+            signed_Q := -resize(multQ, 32);
+        end if;
+
+        if multQ(31) = '0' then
+            signed_I := resize(multI, 32);
+        else
+            signed_I := -resize(multI, 32);
+        end if;
+
+        phase_err <= signed_Q - signed_I;
     end if;
 end process;
 

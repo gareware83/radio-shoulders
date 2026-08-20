@@ -46,24 +46,24 @@ entity dsp_top is
         -- instantiated in system_top). Named tap_* rather than reusing the
         -- internal signal names below, since a port and an architecture
         -- signal cannot share a name - these are plain concurrent copies of
-        -- ddc_i/q, mf_i/q, filtered_i/q and sym_i/q, added for visibility
+        -- ddc_i/q, filtered_i/q, gard_i/q and sym_i/q, added for visibility
         -- only and driving nothing else in this entity.
         tap_ddc_i        : out signed(15 downto 0);
         tap_ddc_q        : out signed(15 downto 0);
         tap_ddc_valid    : out std_logic;
 
-        tap_pll_i        : out signed(15 downto 0);   -- post-PLL (= mf_i/q,
-        tap_pll_q        : out signed(15 downto 0);   -- the matched filter's
-        tap_pll_valid    : out std_logic;              -- input either way
-                                                        -- G_PLL is set)
+        tap_pll_i        : out signed(15 downto 0);   -- post-PLL (= sym_i/q,
+        tap_pll_q        : out signed(15 downto 0);   -- the slicer's input
+        tap_pll_valid    : out std_logic;              -- either way G_PLL
+                                                        -- is set)
 
-        tap_filtered_i     : out signed(15 downto 0);
-        tap_filtered_q     : out signed(15 downto 0);
+        tap_filtered_i     : out signed(15 downto 0);  -- post matched filter,
+        tap_filtered_q     : out signed(15 downto 0);  -- BEFORE Gardner/PLL
         tap_filtered_valid : out std_logic;
 
-        tap_sym_i        : out signed(15 downto 0);
-        tap_sym_q        : out signed(15 downto 0);
-        tap_sym_valid    : out std_logic
+        tap_sym_i        : out signed(15 downto 0);    -- post timing recovery
+        tap_sym_q        : out signed(15 downto 0);    -- (= gard_i/q), BEFORE
+        tap_sym_valid    : out std_logic               -- the PLL now
     );
 end dsp_top;
 
@@ -73,9 +73,9 @@ architecture Behavioral of dsp_top is
 --
 --   ADC_IN (real, carrier at fs/4)
 --     -> ddc_fs_4        coarse downconversion, decimate by 2 (4 sps -> 2 sps)
---     -> pll_2nd_order   residual frequency/phase, fine carrier recovery
 --     -> matched_filter  now genuinely at baseband, still 2 sps
 --     -> gardner         symbol timing recovery, 2 sps -> 1 sps
+--     -> pll_2nd_order   residual frequency/phase, fine carrier recovery
 --     -> qpsk_slicer     hard decision, 1 symbol -> 2 bits
 --     -> frame_sync      sync word, phase ambiguity, header, payload, CRC
 --     -> rx_frame_buffer store-and-forward, 32-bit stream to the DMA
@@ -93,22 +93,51 @@ architecture Behavioral of dsp_top is
 -- but sign flips, leaving the PLL to track a small residual offset, which is
 -- what a 2nd-order loop is good at. Asking it to acquire from DC all the way
 -- to fs/4 is the fragile case.
+--
+-- PLL moved TWICE now. First DDC -> PLL -> filter -> gardner (original),
+-- then DDC -> filter -> PLL -> gardner (matched filter ahead of the PLL, to
+-- remove ISI). That second move only bought a ~13% reduction in the PLL's
+-- steady-state jitter (test_bench/loop_model.py, run_pll_closed_loop) and
+-- real hardware/sim lock quality didn't move outside noise (98 -> 104 /1000).
+-- The actual cause wasn't ISI: pd_proc's decision-directed detector runs on
+-- EVERY 2 sps sample, and even a perfectly ISI-free raised-cosine pulse is
+-- near a NULL at the sample exactly between two symbol peaks - that's a
+-- SAMPLING-INSTANT problem, which matched filtering cannot fix no matter
+-- where it sits in the chain. Only timing recovery knows which instant is
+-- which, so the PLL now runs on Gardner's OUTPUT (gard_i/q, 1 sps,
+-- always on-peak) instead of the 2 sps stream feeding Gardner.
+--
+-- This is safe to reorder because Gardner's TED is close to carrier-phase
+-- independent by design - it's the reason the docs already give for using
+-- Gardner over a data-aided TED ("works before anything is demodulated, so
+-- it can bootstrap") - confirmed in this codebase's own closed-loop model,
+-- which never applied carrier correction ahead of Gardner in any of its
+-- passing runs. The PLL now gets exactly the clean, ISI-free, on-peak
+-- samples it always needed, at the cost of one extra pipeline stage of
+-- carrier-tracking latency (Gardner's own acquisition transient) before
+-- carrier lock can begin.
 signal ddc_i, ddc_q   : signed(15 downto 0);
 signal ddc_valid      : std_logic;
-
-signal pll_i, pll_q   : signed(15 downto 0);
-signal pll_valid      : std_logic;
-
-signal mf_i, mf_q     : signed(15 downto 0);
-signal mf_valid       : std_logic;
 
 signal filtered_i     : signed(15 downto 0);
 signal filtered_q     : signed(15 downto 0);
 signal filtered_valid : std_logic;
 
+-- Symbol-timed (1 sps) samples, still carrier-uncorrected: Gardner's output
+-- if G_TIMING, otherwise the matched filter's output passed straight through
+-- (see timing_gen's bypass note - only valid for a testbench already at 1
+-- sps).
+signal gard_i, gard_q : signed(15 downto 0);
+signal gard_valid     : std_logic;
+signal timing_err     : signed(31 downto 0);
+
+signal pll_i, pll_q   : signed(15 downto 0);
+signal pll_valid      : std_logic;
+
+-- Final, carrier-corrected symbol stream feeding the slicer: the PLL's
+-- output if G_PLL, otherwise gard_i/q passed straight through.
 signal sym_i, sym_q   : signed(15 downto 0);
 signal sym_valid      : std_logic;
-signal timing_err     : signed(31 downto 0);
 
 signal bits_valid     : std_logic;
 signal sliced_bits    : std_logic_vector(1 downto 0);
@@ -140,66 +169,26 @@ inst_ddc: entity work.ddc_fs_4
     );
 
 ------------------------------------------------------------------
--- Fine carrier recovery. G_PLL now bypasses this stage rather than
--- selecting between PLL and DDC - useful for isolating the filter
--- from loop behaviour while debugging.
-------------------------------------------------------------------
-pll_gen: if G_PLL = True generate
-
-    inst_pll: entity work.pll_2nd_order
-        port map (
-             clk        => SYS_CLK
-            ,rst        => ARST
-            ,data_valid => ddc_valid
-            ,I_in       => ddc_i
-            ,Q_in       => ddc_q
-            ,I_out      => pll_i
-            ,Q_out      => pll_q
-        );
-
-    -- pll_2nd_order has no valid output: its phase detector registers
-    -- I_rot/Q_rot, so the data is one clock behind its input. Delay the
-    -- strobe to match rather than reusing ddc_valid directly.
-    pll_valid_proc : process (SYS_CLK)
-    begin
-        if rising_edge(SYS_CLK) then
-            if ARST = '1' then
-                pll_valid <= '0';
-            else
-                pll_valid <= ddc_valid;
-            end if;
-        end if;
-    end process;
-
-    mf_i     <= pll_i;
-    mf_q     <= pll_q;
-    mf_valid <= pll_valid;
-
-else generate  -- PLL bypassed: straight from the downconverter
-
-    mf_i     <= ddc_i;
-    mf_q     <= ddc_q;
-    mf_valid <= ddc_valid;
-
-end generate;
-
-------------------------------------------------------------------
--- Matched filter, now at 2 samples/symbol
+-- Matched filter, now at 2 samples/symbol. Runs on the DDC's raw output -
+-- BEFORE carrier recovery, not after (see the signal-declaration comment
+-- above for why).
 ------------------------------------------------------------------
 inst_filter : entity work.matched_filter_rrc
     port map (
         clk        => SYS_CLK,
         rst        => ARST,
-        i_in       => mf_i,
-        q_in       => mf_q,
-        valid_in   => mf_valid,
+        i_in       => ddc_i,
+        q_in       => ddc_q,
+        valid_in   => ddc_valid,
         i_out      => filtered_i,
         q_out      => filtered_q,
         valid_out  => filtered_valid
     );
 
 ------------------------------------------------------------------
--- Symbol timing recovery: 2 sps -> 1 sps at the recovered instant.
+-- Symbol timing recovery: 2 sps -> 1 sps at the recovered instant. Runs on
+-- the matched filter's output DIRECTLY, still carrier-uncorrected - see the
+-- signal-declaration comment above for why that's safe.
 --
 -- G_TIMING = FALSE is NOT a "no timing offset" mode - it assumes the stream is
 -- already at one sample per symbol AND correctly aligned, which is only true
@@ -216,18 +205,64 @@ timing_gen: if G_TIMING = True generate
             ,valid_in   => filtered_valid
             ,i_in       => filtered_i
             ,q_in       => filtered_q
-            ,valid_out  => sym_valid
-            ,i_out      => sym_i
-            ,q_out      => sym_q
+            ,valid_out  => gard_valid
+            ,i_out      => gard_i
+            ,q_out      => gard_q
             ,timing_err => timing_err
         );
 
 else generate
 
-    sym_i      <= filtered_i;
-    sym_q      <= filtered_q;
-    sym_valid  <= filtered_valid;
-    timing_err <= (others => '0');
+    gard_i      <= filtered_i;
+    gard_q      <= filtered_q;
+    gard_valid  <= filtered_valid;
+    timing_err  <= (others => '0');
+
+end generate;
+
+------------------------------------------------------------------
+-- Fine carrier recovery. Runs on Gardner's OUTPUT now (1 sps, always
+-- on-peak) rather than the 2 sps stream feeding it - see the
+-- signal-declaration comment above for why. G_PLL bypasses this stage -
+-- useful for isolating timing recovery from carrier-loop behaviour while
+-- debugging.
+------------------------------------------------------------------
+pll_gen: if G_PLL = True generate
+
+    inst_pll: entity work.pll_2nd_order
+        port map (
+             clk        => SYS_CLK
+            ,rst        => ARST
+            ,data_valid => gard_valid
+            ,I_in       => gard_i
+            ,Q_in       => gard_q
+            ,I_out      => pll_i
+            ,Q_out      => pll_q
+        );
+
+    -- pll_2nd_order has no valid output: its phase detector registers
+    -- I_rot/Q_rot, so the data is one clock behind its input. Delay the
+    -- strobe to match rather than reusing gard_valid directly.
+    pll_valid_proc : process (SYS_CLK)
+    begin
+        if rising_edge(SYS_CLK) then
+            if ARST = '1' then
+                pll_valid <= '0';
+            else
+                pll_valid <= gard_valid;
+            end if;
+        end if;
+    end process;
+
+    sym_i     <= pll_i;
+    sym_q     <= pll_q;
+    sym_valid <= pll_valid;
+
+else generate  -- PLL bypassed: straight from Gardner
+
+    sym_i     <= gard_i;
+    sym_q     <= gard_q;
+    sym_valid <= gard_valid;
 
 end generate;
 
@@ -316,25 +351,33 @@ inst_rxbuf : entity work.rx_frame_buffer
 
 ------------------------------------------------------------------
 -- Sniffer tap points - plain copies, drive nothing else in this entity.
--- tap_pll_i/q come from mf_i/q rather than pll_i/q: mf_i/q is the matched
--- filter's actual input either way the G_PLL generate resolves, where
+-- tap_pll_i/q come from sym_i/q rather than pll_i/q: sym_i/q is the
+-- slicer's actual input either way the G_PLL generate resolves, where
 -- pll_i/q is only driven inside the G_PLL=true branch and would read 'U' in
 -- simulation with the PLL bypassed.
+--
+-- Pipeline order is now ddc -> filtered -> gard -> pll (PLL moved AFTER
+-- Gardner, its second move - see the signal-declaration comment above), so
+-- tap_sym (Gardner's own 1 sps output, gard_i/q) now sits BEFORE tap_pll
+-- (the final, carrier-corrected sym_i/q) in the chain - the reverse of the
+-- original ddc -> pll -> filtered -> sym order. The tap names still mean
+-- what they say (post-matched-filter, post-PLL, post-timing-recovery) -
+-- only their relative position and underlying signal moved.
 ------------------------------------------------------------------
 tap_ddc_i     <= ddc_i;
 tap_ddc_q     <= ddc_q;
 tap_ddc_valid <= ddc_valid;
 
-tap_pll_i     <= mf_i;
-tap_pll_q     <= mf_q;
-tap_pll_valid <= mf_valid;
-
 tap_filtered_i     <= filtered_i;
 tap_filtered_q     <= filtered_q;
 tap_filtered_valid <= filtered_valid;
 
-tap_sym_i     <= sym_i;
-tap_sym_q     <= sym_q;
-tap_sym_valid <= sym_valid;
+tap_sym_i     <= gard_i;
+tap_sym_q     <= gard_q;
+tap_sym_valid <= gard_valid;
+
+tap_pll_i     <= sym_i;
+tap_pll_q     <= sym_q;
+tap_pll_valid <= sym_valid;
 
 end Behavioral;

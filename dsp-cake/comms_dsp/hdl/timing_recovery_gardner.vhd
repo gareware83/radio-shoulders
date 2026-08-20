@@ -37,19 +37,26 @@ use work.all;
 -- the same rules the PLL loop filter needed: full-width products, an explicit
 -- gain shift, and saturation rather than wrapping.
 --
--- FIRST THING TO CHECK IN SIM: loop polarity. The error is added to the phase
--- increment; whether that pulls the sampling instant toward or away from the
--- correct one depends on the sign convention, and getting it backwards turns a
--- converging loop into a diverging one. If timing_err grows instead of settling
--- toward zero, negate adj_v. G_K and G_GAIN_FRAC are untuned starting values in
--- the same way C_GAIN_FRAC was for the PLL.
+-- Loop polarity: the error is added to the phase increment with adj_v
+-- negated (see loopf_proc below) - confirmed against loop_model.py's
+-- bit-exact GardnerFixedPoint model (negate=True), which converges cleanly
+-- to the nominal increment under a realistic timing-offset+ppm stimulus.
+-- If timing_err ever grows instead of settling toward zero in sim, that
+-- polarity is the first thing to re-check.
+--
+-- G_K/G_GAIN_FRAC designed by test_bench/loop_model.py (Bn*Ts=0.01,
+-- zeta=0.707) from the TED's measured Kd against matched-filtered (not just
+-- TX-shaped) stimulus - not the untuned placeholders these replace. This
+-- filter has no integral term (G_K is the textbook Kp directly - see
+-- design_pi_loop()'s docstring), so unlike the PLL's K1/K2 there's no
+-- topology mapping needed here.
 ------------------------------------------------------------------------------
 entity timing_recovery_gardner is
     generic (
         -- Loop gain is Q(G_GAIN_FRAC): effective gain = G_K / 2**G_GAIN_FRAC.
         -- Raise to slow the loop and add headroom, lower to speed acquisition.
-        G_GAIN_FRAC : natural := 24;
-        G_K         : integer := 64
+        G_GAIN_FRAC : natural := 16;
+        G_K         : integer := 12578
     );
     port (
         clk        : in  std_logic;
@@ -176,7 +183,7 @@ begin
                         -- Loop filter: scale by the fixed-point gain, then clamp
                         -- the loop's authority over the increment.
                         loop_v := to_signed(G_K, 16) * e_v;
-                        adj_v  := clamp_adj(shift_right(loop_v, G_GAIN_FRAC));
+                        adj_v  := -clamp_adj(shift_right(loop_v, G_GAIN_FRAC));
                         adj    <= adj_v;
 
                         -- C_NOMINAL_INCR is 2**31, which does NOT fit in a

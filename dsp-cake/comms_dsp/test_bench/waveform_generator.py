@@ -8,9 +8,39 @@ import matplotlib.pyplot as plt
 # "sync never fires" with no other clue.
 # ---------------------------------------------------------------------------
 SYNC_WORD = 0x1ACFFC1D          # CCSDS ASM
-PREAMBLE_WORD = 0xCCCCCCCC      # see the long note in pkg.vhd - NOT 0xAAAA...
 CRC_POLY = 0x1021               # CRC-16-CCITT
 CRC_INIT = 0xFFFF
+
+# Preamble: a fixed (deterministic, reproducible), pseudorandom bit
+# sequence - NOT a short repeating word like the 0xCCCCCCCC pkg.vhd's
+# C_PREAMBLE comment describes (that constant is now unused; frame_sync
+# never searches for the preamble - it hunts SYNC_WORD - so this is a pure
+# transmit-side choice and changing it costs nothing on the receive side,
+# exactly as that comment already notes).
+#
+# pkg.vhd's reasoning for 0xCCCCCCCC (pairs alternate (1,1),(0,0), a
+# transition every symbol - "the maximum-density timing information the
+# detector can be given") is correct for the CARRIER loop, but misses a
+# well-documented Gardner TED failure mode against exactly this kind of
+# periodic data: "self-noise" - nonzero average timing error even at
+# PERFECT timing. Confirmed directly, not assumed: loop_model.py's
+# run_gardner_alternating() drives GardnerFixedPoint with this same
+# (1,1),(0,0) alternating pattern and incr saturates at its ceiling even
+# at ZERO timing offset and ZERO ppm, i.e. with nothing to correct.
+# Doubling preamble_bits (256->512, chasing a different bug at the time)
+# doubled the exposure to this and measurably WORSENED real hardware lock
+# quality (607 -> 429 /1000) instead of helping, which is what surfaced
+# this in the first place.
+#
+# A fixed pseudorandom sequence has the same statistical character as real
+# payload data, which loop_model.py's run_gardner_closed_loop already shows
+# Gardner tracks cleanly (no self-noise pathology) - still gives the
+# carrier loop plenty of transitions (any run of same-symbol bits is short
+# and rare in a random sequence), without the periodicity that trips
+# Gardner up. Seeded separately from the payload RNG so extending
+# preamble_bits never perturbs which random payload bytes a test uses.
+PREAMBLE_BITS_MAX = 2048
+PREAMBLE_BITS = np.random.default_rng(0xC0FFEE).integers(0, 2, PREAMBLE_BITS_MAX).tolist()
 
 FRAME_TYPE_CMD, FRAME_TYPE_DATA, FRAME_TYPE_ACK = 0x0, 0x1, 0x2
 
@@ -213,11 +243,18 @@ class RRCWaveformGenerator:
         if len(payload) > 255:
             raise ValueError(f"payload {len(payload)} B exceeds the 255 B format limit")
 
+        if preamble_bits > PREAMBLE_BITS_MAX:
+            raise ValueError(f"preamble_bits {preamble_bits} exceeds the "
+                             f"precomputed PREAMBLE_BITS_MAX {PREAMBLE_BITS_MAX} "
+                             f"- raise PREAMBLE_BITS_MAX if a longer lead-in "
+                             f"is genuinely needed")
+
         bits = []
 
-        # Preamble: repeat the 32-bit pattern, truncated to preamble_bits
-        pre = word_to_bits(PREAMBLE_WORD, 32)
-        bits.extend((pre * ((preamble_bits + 31) // 32))[:preamble_bits])
+        # Preamble: fixed pseudorandom sequence, not a repeating word - see
+        # PREAMBLE_BITS's module-level comment for why (Gardner self-noise
+        # against periodic data).
+        bits.extend(PREAMBLE_BITS[:preamble_bits])
 
         bits.extend(word_to_bits(SYNC_WORD, 32))
 
@@ -1039,7 +1076,19 @@ if __name__ == "__main__":
                                fs=FS, seed=1234)
 
     # Framed burst: 4 frames of real user data through the full receiver.
-    gen.run_frames(n_frames=4, payload_len=16)
+    #
+    # preamble_bits=512 (256 symbols), not the 256-bit/128-symbol default:
+    # with the PLL sign bug fixed, loop_model.py's pure-tone closed-loop
+    # plot (test_bench/pll_pure_tone_trace.png) shows a genuine cold-start
+    # settling time of ~300-500 samples (~150-250 symbols) before phase_err
+    # damps down to its steady small-signal band. Against a 128-symbol
+    # preamble and a 32-symbol gap forcing reacquisition every frame, that's
+    # not consistently enough lead-in - 2 of 4 frames locked in the last
+    # tb_dsp.vhd run (quality ratio 607/1000, sync_count=2), which fits
+    # "some frames' preambles happen to converge fast enough, some don't"
+    # rather than a structural failure. Doubling the preamble gives the loop
+    # roughly 2x its own settling time to work with.
+    gen.run_frames(n_frames=4, payload_len=16, preamble_bits=512)
 
     # Front-end-only stimulus (no framing) is still available:
     #   gen.run()
