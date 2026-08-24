@@ -738,7 +738,10 @@ Deliberately simple, chosen to be easy to parse in an FSM and easy to swap out l
   0xAAAAAAAA  0x1ACFFC1D   see below
 ```
 
-- **Preamble** `0xAAAAAAAA` — alternating 1/0 for AGC settling and timing recovery.
+- **Preamble** `0xAAAAAAAA` — alternating 1/0 for AGC settling and timing
+  recovery. **Superseded twice since** — see the "Bug 1"/"Bug 2" entries
+  further down and `docs/system_design.md` §4.4 for the full story. Final
+  state: a fixed pseudorandom bit sequence, not a repeating word at all.
 - **Sync word** `0x1ACFFC1D` — the CCSDS attached sync marker. Standard, good autocorrelation, correlator-friendly.
 - **Header** — `[15:12]` type (0=command, 1=data, 2=ack), `[11:4]` payload length in bytes, `[3:0]` reserved.
 - **CRC-16-CCITT** (poly `0x1021`) over header+payload — cheap LFSR in PL.
@@ -877,6 +880,17 @@ ADC_IN (real, carrier at fs/4)
   -> matched_filter  genuinely at baseband, 2 sps
 ```
 
+**This order is superseded — twice more, since.** The PLL moved after the
+matched filter, then after Gardner too: final order is
+`ddc_fs_4 -> matched_filter_rrc -> timing_recovery_gardner -> pll_2nd_order`.
+See `docs/system_design.md` §2.1 for why (the PLL's decision-directed
+detector needed clean, on-peak, carrier-independent-acquisition samples more
+than it needed to run early) and the "NCO / carrier recovery" section below
+for the sign bug that turned out to be the bigger blocker. The
+"division of labour" reasoning below (DDC strips the bulk carrier, PLL
+tracks the residual) is still correct and unaffected by the reordering —
+only what sits *between* the DDC and the PLL changed.
+
 The division of labour matters: the DDC strips the bulk carrier using nothing but sign flips (no multipliers), leaving the PLL to track a small residual — what a 2nd-order loop is actually good at. Asking the PLL to acquire from DC all the way to fs/4 is the fragile case, especially with no centre-frequency term in the accumulator.
 
 `G_PLL` was repurposed rather than removed: it now **bypasses** the PLL (DDC → filter directly), which is useful for isolating the filter from loop behaviour while tuning.
@@ -956,7 +970,18 @@ Bugs caught on self-review before simulation, all worth knowing about because th
 - **`timing_err` used `resize(err, 32)` on a 34-bit value**, silently dropping the top two bits so a large error could read back as a small one. Now saturates via `sat32()`.
 - The `incr` update recomputed the clamped adjustment inline instead of reusing `adj` — redundant and a place for the two copies to drift apart. Now computed once into `adj_v`.
 
-**Not yet simulated, and not yet wired into `dsp_top`** — the chain still ends at `matched_filter_rrc`. First thing to check in sim is **loop polarity**: the adjustment is added to the increment, and whether that pulls the sampling instant toward or away from correct depends on the sign convention. Backwards polarity turns a converging loop into a diverging one. If `timing_err` grows instead of settling toward zero, negate `adj_v`. `G_K = 64` / `G_GAIN_FRAC = 24` are untuned starting values in exactly the way `C_GAIN_FRAC` was for the PLL.
+**Update — simulated, wired in, and now passing.** Everything in this
+paragraph as originally written is resolved: Gardner is wired into
+`dsp_top` (now running *before* the PLL, not after — see the chain-order
+note above), the polarity question was real (`adj_v` does need negating -
+confirmed in sim) but turned out not to be the dominant blocker, and
+`G_K = 64` / `G_GAIN_FRAC = 24` have been replaced with values designed by
+`test_bench/loop_model.py` from the TED's measured Kd:
+**`G_K = 12578` / `G_GAIN_FRAC = 16`**. `tb_dsp.vhd` now passes end to end
+(4/4 frames, quality ratio 719/1000) — see `docs/system_design.md` §2.1 and
+§4.4 for the two bugs (a PLL sign error, and a preamble pattern that
+triggered Gardner self-noise) that were actually blocking lock, neither of
+which was Gardner's own polarity.
 
 ### Framed-burst stimulus and the floating-point reference receiver
 
@@ -985,6 +1010,8 @@ Both questions it was built to answer came back *no*, which is the point:
 
 **Bug 1 — `C_PREAMBLE = 0xAAAAAAAA` gives the timing loop no error signal.** Under this QPSK mapping `1010...` maps every symbol pair to `(b1,b0) = (1,0)` — the *same constellation point every time*. Gardner's error is `(I[k] - I[k-1]) * I[k-1/2]`; with no symbol transitions that difference is identically zero, so the timing loop cannot acquire during the preamble at all. Changed to **`0xCCCCCCCC`** (`1100...`), which alternates between two antipodal points, giving a transition every symbol and reducing to BPSK for the carrier loop. Alternating bits are the right instinct at the *bit* level; this constellation cares about the *symbol* level. Costs nothing in the receiver — `frame_sync` hunts the sync word, never the preamble.
 
+**Follow-up, found much later via `loop_model.py` + real RTL sim, not `rx_model.py` (which doesn't model Gardner at all) — `0xCCCCCCCC` has its own problem.** Its exact period-2 QPSK symbol pattern triggers a well-documented Gardner TED failure mode, "self-noise": nonzero average timing error even at PERFECT sampling. Confirmed directly with `loop_model.py`'s `run_gardner_alternating()` — `incr` saturates at its ceiling against this pattern even at ZERO timing offset and ZERO ppm. Doubling the preamble length to buy the PLL more settling time (see the PLL sign-bug entry below) doubled the exposure and measurably WORSENED lock quality (607 → 429/1000) instead of helping, which is what surfaced this. **Final fix: a fixed pseudorandom bit sequence**, not a repeating word at all — see `docs/system_design.md` §4.4.
+
 **Bug 2 — `ddc_fs_4` produced the conjugate baseband.** The Q branch used `+sin`, making the mixer multiply by `cos + j·sin = exp(+jωn)` — an *up*conversion. Downconversion is `exp(-jωn) = cos - j·sin`, so the sin term must be negated:
 
 ```
@@ -996,7 +1023,7 @@ This is the more interesting failure because of *how well it hides*. A conjugate
 
 Fixed in `ddc_fs_4.vhd` and in `fs_by_4_mix()` in `dsp_pkg.vhd` (unused by the DDC, which has inline logic, but it would have reintroduced the same bug).
 
-**Consequence to check:** flipping the Q sign also flips the apparent sign of any residual frequency offset, so `pll_2nd_order`'s loop polarity needs re-confirming against the corrected DDC — a loop that converged before may now diverge.
+**Consequence to check — resolved, and the actual finding was bigger than "polarity."** This flagged the right general concern but the real bug found later wasn't a simple polarity flip: `pd_proc` rotates the input FORWARD by `theta_nco` instead of the standard derotation, which flips which SIGN of `K1`/`K2` gives negative feedback. Fed straight into the standard closed-form design formula, the measured detector gain produced a `K1`/`K2` pair that passed every dead-zone/margin check while the real closed loop had positive feedback — confirmed with `loop_model.py`'s `run_pll_pure_tone()` (a single-tone closed-loop test with no data at all: wrong sign oscillates continuously across virtually the whole detector range regardless of bandwidth/damping/clamping; negating both `K1` and `K2` collapsed that to a clean textbook step response). See `docs/system_design.md` §2.1 and `pll_2nd_order.vhd`'s `K1`/`K2` comment for the full derivation.
 
 After both fixes the model recovers all 4 frames, CRC OK, at all four carrier lock angles.
 
@@ -1038,6 +1065,8 @@ Planned tuner, **not yet built**:
 Optimising frame count *directly* is the mistake — it is flat almost everywhere.
 
 **Deliberately deferred: making the coefficients writable.** That means converting `timing_recovery_gardner` and `pll_2nd_order` from generics to ports — churn on two modules currently under suspicion — and more fundamentally a tuner can only fix what is tunable. Until the chain is known structurally correct, a search would grind indefinitely proving no coefficient helps.
+
+*Update: the chain is now known structurally correct* — `tb_dsp.vhd` passes end to end (see the checklist near the end of this doc) — so that specific blocking reason no longer applies. Still deferred as a matter of priority, not because it's blocked; `test_bench/loop_model.py` now covers the "what should the coefficients be" half of this in software, which may make an on-hardware search less necessary than it looked when this was written.
 
 ### Open issues in the DSP chain
 
@@ -1195,14 +1224,24 @@ freezes until armed again. Same shape as `rx_frame_buffer` — a frozen
 snapshot the PS reads at its own pace has no producer/consumer race to get
 wrong, where a free-running circular buffer would.
 
-**Four tap points**, `MODE.CAPTURE_TAP` (bits 9:8) — post-DDC, post-PLL, post
-matched filter, post-Gardner (the same point `rx_quality` already taps).
+**Four tap points**, `MODE.CAPTURE_TAP` (bits 9:8) — post-DDC, post matched
+filter, post-Gardner, post-PLL (the same point `rx_quality` already taps).
 Exposing these needed four new output port groups on `dsp_top` (`tap_ddc_*`,
 `tap_pll_*`, `tap_filtered_*`, `tap_sym_*`) — none of the intermediate
-signals were ports before this. `tap_pll_*` is wired from `mf_i`/`mf_q`, not
-`pll_i`/`pll_q` — the latter are only driven inside `dsp_top`'s `G_PLL=true`
-generate branch and would read `'U'` in simulation with the PLL bypassed;
-`mf_i`/`mf_q` is the matched filter's real input either way.
+signals were ports before this. `tap_pll_*` is wired from `sym_i`/`sym_q`,
+not `pll_i`/`pll_q` — the latter are only driven inside `dsp_top`'s
+`G_PLL=true` generate branch and would read `'U'` in simulation with the
+PLL bypassed; `sym_i`/`sym_q` is the slicer's real input either way.
+
+*Note: pipeline order and tap wiring here reflect the ORIGINAL
+`ddc -> pll -> filter -> gardner` chain this section was written against.*
+*The PLL has since moved twice (see the chain-order note earlier in this*
+*doc) — current order is `ddc -> filter -> gardner -> pll`, so*
+*`tap_filtered_*` and `tap_sym_*` now sit BEFORE `tap_pll_*` in the*
+*pipeline, and `tap_pll_*`/`tap_sym_*` are wired from different underlying*
+*signals than described above (`sym_i`/`gard_i` respectively). Tap*
+*semantics (what each one is downstream of) are unchanged; see*
+*`docs/system_design.md` §4.3's table for the current, accurate mapping.*
 
 ### Address map: a second region on the same AXI4-Lite bus, not a second slave
 
@@ -1426,18 +1465,63 @@ Live state at the end of the last working session. Nothing here is settled.
 
 ### 0. State of the board and tree right now
 
-**Confirmed on hardware:** `BUILD_ID` matches the tree the 40 MHz bitstream was actually built from, and Vivado reports timing met at 40 MHz (positive `WNS`, replacing the earlier `-1.017 ns` at 50 MHz — see "Timing" in the status list below). The loopback demo ran on real hardware for the first time this session too, surfacing the current live bug: `radioctl loopback ddc_input.dat` reports `quality 0.417` (the "no carrier structure" value — matches both a spinning constellation and noise, see the DSP Chain section) and zero frames/syncs. `probe_const.dat` (§ "RX Loopback Demo") exists specifically to bisect DDC vs PLL on this and has not been run yet.
+**RTL simulation: `tb_dsp.vhd` passes end to end.** The `quality 0.417` /
+zero-frames bug described in the rest of this "WHERE THINGS STAND" section
+and the "Diagnostic sample sniffer" investigation below is **resolved** — not
+by the sniffer bisect this section was about to run, but by three separate
+bugs found afterward, mostly via a new tool (`test_bench/loop_model.py`):
 
-**New, unbuilt, unbooted:** a diagnostic sample sniffer (`sample_sniffer.vhd` + changes to `pkg.vhd`/`reg_rw_interface.vhd`/`dsp_top.vhd`/`system_top.vhd`), built specifically to make that bisect (and future DSP debugging generally) direct instead of inferred from one ratio — see the "Diagnostic sample sniffer" section below for the full design. **None of it has been through Vivado, GHDL, or hardware yet** — no GHDL was available in the environment that wrote it, so verification so far is: careful manual trace of the new AXI wait-state FSM, a rewritten `tb_reg_rw_interface.vhd` (needs an actual simulator run), and full compiles of the C/C++ side including a synthetic-data functional test. `ID_MAGIC` was bumped `...0001` → `...0002` for the register map change, so a stale board will visibly disagree with new `radioctl`/`radiomon` rather than silently misbehave.
+1. The PLL's carrier phase detector formula was structurally broken — it
+   never responded to the input's actual phase, only to the NCO's own phase
+   and the input's magnitude. Fixed with a decision-directed Costas error.
+2. The PLL's loop-filter gains (`K1`/`K2`) had the wrong SIGN — `pd_proc`
+   rotates the input forward by `theta_nco` rather than the standard
+   derotation closed-form PLL design formulas assume, and that flips which
+   sign gives negative feedback. This was the big one: it passed every
+   dead-zone/margin check while the real closed loop had positive feedback,
+   and no amount of bandwidth or damping tuning could have found it —
+   caught by driving the PLL against a single unmodulated tone with no data
+   at all (`loop_model.py`'s `run_pll_pure_tone()`).
+3. The preamble pattern (`0xCCCCCCCC`, an exact period-2 QPSK alternation)
+   triggered a Gardner TED self-noise pathology, confirmed the same way
+   (`run_gardner_alternating()`). Replaced with a fixed pseudorandom
+   sequence.
+
+Along the way the PLL also moved twice in the chain (after the matched
+filter, then after Gardner) — real but secondary; see
+`docs/system_design.md` §2.1 for the full account and §4.4 for the preamble
+story. Current result: `tb_dsp.vhd` reports 4/4 frames CRC-clean, 4/4 sync
+detections, quality ratio 719/1000. **This has NOT yet been re-confirmed on
+real hardware** — the `quality 0.417` symptom this section describes was a
+hardware (`radioctl loopback`) observation, and the fixes above have only
+been verified in RTL simulation so far. Re-running the loopback demo on the
+board with a freshly-built bitstream is the natural next step.
+
+**Diagnostic sample sniffer status, as last known:** `sample_sniffer.vhd` +
+the `pkg.vhd`/`reg_rw_interface.vhd`/`dsp_top.vhd`/`system_top.vhd` changes
+supporting it had passed `tb_reg_rw_interface.vhd` in simulation (a
+one-cycle BRAM read-latency bug was found and fixed there) but **had not yet
+been confirmed on real hardware** as of this update. Tap wiring inside
+`dsp_top.vhd` changed twice since (see §0's chain-order note and
+`docs/system_design.md` §4.3) — the tap semantics (post-DDC/filter/Gardner/PLL)
+are unchanged, but the underlying signal each one is wired from moved.
+`ID_MAGIC` bump (`...0001` → `...0002`) and the rest of the table below are
+still accurate as descriptions of that work; only its "never simulated"
+status has changed.
 
 | Thing | State | Consequence |
 |---|---|---|
-| Sniffer RTL | Written, never simulated or synthesized | **Run `tb_reg_rw_interface.vhd` before flashing** — it now covers the capture-region read-latency path end to end, not just the control registers |
+| Sniffer RTL | Passed `tb_reg_rw_interface.vhd` in simulation; hardware status unconfirmed as of this update | Re-verify on hardware alongside the RX-chain fixes above |
 | `sample_sniffer.vhd` | New file | Picked up automatically by `create_project.tcl`'s `glob $hdl_dir/*.vhd`, no script edit needed |
 | `radioctl`/`radiomon` | Rebuilt into `output-zybo/target/` (constants mirror, `ID_MAGIC` bump, capture readout) | Needs an image rebuild and the rootfs update dance below |
 | `clk_ignore_unused` | In both `boot.cmd` files | Confirm the `boot.scr` on the FAT partition was regenerated; otherwise it only applies when typed by hand at the U-Boot prompt |
 
-**Next action:** run `tb_reg_rw_interface.vhd` in simulation (GHDL or Vivado xsim — neither was available where this was written). If it passes, rebuild the bitstream, confirm `radioctl read build`/`STATUS.BUILD_DIRTY` and `radioctl dump`'s `id` line read as expected (the magic bump means a stale board will say so explicitly), then run `probe_const.dat` through `radioctl loopback` to finally answer DDC-vs-PLL — and now the sniffer gives a second, direct way to answer the same question if the probe result is ambiguous: `radiomon --capture ddc` and `--capture pll` during a loopback run should show a static point (correct) or a rotating/scattered cloud (broken) at whichever stage is actually at fault.
+**Next action:** build a fresh bitstream with the RX-chain fixes above, load
+it onto the board, confirm `radioctl read build`/`STATUS.BUILD_DIRTY` and
+`radioctl dump`'s `id` line read as expected, then re-run `radioctl loopback`
+against the same stimulus `tb_dsp.vhd` now passes against and see whether
+hardware agrees with simulation. `radiomon --capture <tap>` remains the
+direct way to inspect any one stage if it doesn't.
 
 Avoid another hand edit to the BD: the script is the source of truth and has now proven it can rebuild the design.
 
@@ -1474,6 +1558,14 @@ That **rules out a loop polarity inversion** — a diverging loop never produces
 `rx_model.py` decodes the same stimulus 4/4. The model and the RTL differ in exactly one respect — the model uses ideal timing and ideal carrier derotation. That points at loop residual error, not correctness.
 
 Unexplored theory worth testing: during the 32-symbol inter-frame gaps the signal is zero, so Gardner's error term (a *product* of samples) goes to zero and `incr` holds, but the phase accumulator free-runs and may land on the wrong half-symbol when the next preamble arrives. Capture `inst_timing/incr` across a gap — if it walks away from `0x80000000` while the input is silent, that is the mechanism, and it would explain "some frames acquire, some don't".
+
+*Status: never directly tested — superseded by a sufficient explanation
+found a different way. The actual "some frames acquire, some don't" cause
+turned out to be the preamble content itself (`0xCCCCCCCC` triggering
+Gardner self-noise, see "Bug 1" above), and fixing that alone got
+`tb_dsp.vhd` to 4/4 frames. This gap-drift theory was never explicitly
+ruled OUT, so it may still be a real, smaller contributor - but it's no
+longer necessary to explain the symptom that prompted it.*
 
 ### 3. The Vivado script — resolved, including one bug that hard-locked the board
 
@@ -1545,14 +1637,14 @@ Watch the output trees: they are named `output/`, `output-zybo/` and `output-pyn
   - [x] Real RRC taps generated at the RX rate (9 taps @ 2 sps) and matched to TX shaping; filter convolution + output scaling fixed
   - [x] Stimulus moved to an fs/4 carrier, seeded for reproducibility; reference symbols now carry both I and Q
   - [x] DDC output stage fixed (`i_out` was permanently zero) and put in series ahead of the PLL rather than branched against it
-  - [x] Chain verified in simulation with the series DDC→PLL→filter order
+  - [x] Chain verified in simulation — order changed twice since (DDC→PLL→filter, then DDC→filter→PLL→Gardner, then the current DDC→filter→Gardner→PLL); see "Where things stand" §0
   - [x] Full RX chain written and wired: Gardner timing recovery → QPSK slicer → frame sync → store-and-forward buffer → S2MM stream
   - [x] Two convention bugs found by the Python reference model before RTL sim: preamble mapping to a constant symbol, and `ddc_fs_4` producing conjugate baseband
   - [x] Bit-truth self-checking testbench (compares every S2MM beat against transmitted payload)
   - [x] Lock-quality metric (`rx_quality.vhd`) + `sync_count`, readable from the PS
-  - [~] **RX chain does not yet recover frames on hardware** — `radioctl loopback` reads `quality 0.417` (no carrier structure), zero frames/syncs. `probe_const.dat` exists to bisect DDC vs PLL; not yet run. See "Where things stand".
+  - [x] **RX chain now recovers frames in RTL simulation** — `tb_dsp.vhd`: 4/4 frames CRC-clean, 4/4 sync detections, quality ratio 719/1000. Took three bugs to get there (broken PLL phase detector formula, a PLL loop-filter sign error, and a preamble pattern triggering Gardner self-noise) — see "Where things stand" §0 and `docs/system_design.md` §2.1/§4.4. **Not yet re-confirmed on hardware** — the `quality 0.417` symptom this line used to describe was a hardware observation; re-running `radioctl loopback` with a fresh bitstream is the next step, not yet done.
   - [ ] Farrow interpolator / polyphase timing recovery — deferred to a standalone project
-  - [ ] Automatic loop tuner — metric built, coefficient registers deliberately not yet added
+  - [ ] Automatic loop tuner — metric built, coefficient registers deliberately not yet added; `test_bench/loop_model.py` now covers gain *design* in software, which may reduce how much of this is still needed
 - [x] **PL register window pinned to `0x43C0_0000`** with a build-time check — an unpinned `assign_bd_address` put it at `0x4000_0000` and hard-locked the CPU on every register access
 - [x] `boot.scr` generated by `post-image.sh`, with a build-time check that the requested FIT configuration exists
 - [x] Persistent-root boot confirmed on hardware (`mmcblk0p2` at `/`), double-mount of the root partition fixed
@@ -1560,9 +1652,9 @@ Watch the output trees: they are named `output/`, `output-zybo/` and `output-pyn
 - [x] NTP (busybox `ntpd`) against the dev host on both boards — no RTC on either
 - [x] **`clk_ignore_unused` in bootargs** — without it FCLK0 is gated off after boot, the PL runs unclocked, and any register access hard-locks the CPU
 - [x] **Timing**: was WNS −1.017 ns on 96 endpoints in the matched filter's DSP cascade, at a constraint that turned out to be correct all along (50 MHz, matching the dts). FCLK0 dropped to 40 MHz in both the tcl and the dts; **confirmed WNS positive in Vivado on hardware rebuild**. Pipelining the filter MAC would still be the more headroom-generous fix, not currently planned
-- [x] **RX loopback demo**: `radioctl loopback` plays a sample file through DDR → MM2S → RX chain → S2MM → DDR and checks every beat against the transmitted payload. One transfer per frame, boundaries from `rx_chunks.txt`, because the single frame buffer backpressures and a 3 µs gap is not re-armable from userspace. **Run on hardware** — surfaced the current live bug (quality 0.417, see above) rather than confirming a working RX chain
+- [x] **RX loopback demo**: `radioctl loopback` plays a sample file through DDR → MM2S → RX chain → S2MM → DDR and checks every beat against the transmitted payload. One transfer per frame, boundaries from `rx_chunks.txt`, because the single frame buffer backpressures and a 3 µs gap is not re-armable from userspace. Last run on hardware surfaced `quality 0.417` / zero frames — since traced to three RTL bugs, all fixed and confirmed in `tb_dsp.vhd` simulation (see "Where things stand" §0). **Re-running this demo on hardware against the fix is the next action, not yet done.**
 - [x] `radiomon` — live terminal plot of the lock-quality ratio + counters, register window only. Cross-compiles for the board (needed one 32-bit fix in the vendored plot library). `frame()`/`margin()` in the vendored plot library segfault on this toolchain (confirmed upstream too) — every render path rewritten to bypass them; see "Diagnostic sample sniffer"
-- [~] **Diagnostic sample sniffer** (`sample_sniffer.vhd`) — single-shot capture buffer, 4 selectable RX-chain tap points, exposed as a second address region on the existing register AXI4-Lite bus (not a new slave), read via `radiomon --capture <tap>`. RTL + software written and cross-compiled; `tb_reg_rw_interface.vhd` rewritten to cover the new AXI wait-state path end to end. **Not yet run through any simulator or on hardware** — no GHDL available where this was built. `ID_MAGIC` bumped `...0001`→`...0002` for the register map change
+- [~] **Diagnostic sample sniffer** (`sample_sniffer.vhd`) — single-shot capture buffer, 4 selectable RX-chain tap points, exposed as a second address region on the existing register AXI4-Lite bus (not a new slave), read via `radiomon --capture <tap>`. RTL + software written and cross-compiled; `tb_reg_rw_interface.vhd` rewritten to cover the new AXI wait-state path end to end — **now passes** (a one-cycle-early BRAM read-latency bug was found and fixed there). Tap wiring inside `dsp_top.vhd` changed twice since as the chain reordered (see "Where things stand" §0); semantics unchanged, underlying signals moved. **Hardware status unconfirmed as of this update.** `ID_MAGIC` bumped `...0001`→`...0002` for the register map change
 - [ ] CI joining the Vivado and Buildroot builds (bitstream → `board/common/` → FIT is currently a manual step)
 - [x] **PL/PS plumbing live on hardware** — AXI DMA probes at `0x8040_0000`, `/dev/uio0` maps the register window at `0x43C0_0000`, FPGA manager present at `/sys/class/fpga_manager/fpga0`
 - [x] Register control path end-to-end, **verified on hardware** — rebuilt `reg_rw_interface` (real address decode, RO/RW split, pulse bits) + `radioctl` in the rootfs. `id` reads `0x5A790002` (bumped for the sniffer's register-map change), RW registers round-trip (`mode`, `tx_len`), `tx_start` self-clears after `transmit`.

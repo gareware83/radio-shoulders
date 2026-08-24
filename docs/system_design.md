@@ -57,9 +57,9 @@ flowchart TB
     DMA["AXI DMA<br/>MM2S"]
 
     DDC["<b>ddc_fs_4</b><br/>fs/4 quadrature mix<br/>decimate ÷2"]
-    PLL["<b>pll_2nd_order</b><br/>carrier recovery<br/>NCO + loop filter"]
     MF["<b>matched_filter_rrc</b><br/>9-tap RRC, α=0.35"]
     TR["<b>timing_recovery_gardner</b><br/>Gardner TED + PI loop"]
+    PLL["<b>pll_2nd_order</b><br/>carrier recovery<br/>NCO + loop filter"]
     SL["<b>qpsk_slicer</b><br/>hard decision"]
     FS["<b>frame_sync</b><br/>sync word · phase ambiguity<br/>header · CRC-16"]
     BUF["<b>rx_frame_buffer</b><br/>store-and-forward<br/>32-bit packer"]
@@ -69,37 +69,74 @@ flowchart TB
 
     DDR -->|"32-bit AXIS"| DMA
     DMA -->|"real, 4 sps<br/>carrier @ fs/4"| DDC
-    DDC -->|"I/Q, 2 sps"| PLL
-    PLL -->|"I/Q, 2 sps<br/>baseband"| MF
+    DDC -->|"I/Q, 2 sps"| MF
     MF -->|"I/Q, 2 sps<br/>pulse-matched"| TR
-    TR -->|"I/Q, 1 sps<br/>symbol instant"| SL
+    TR -->|"I/Q, 1 sps<br/>symbol instant<br/>carrier-uncorrected"| PLL
+    PLL -->|"I/Q, 1 sps<br/>carrier-corrected"| SL
     SL -->|"2 bits/symbol"| FS
     FS -->|"payload bytes"| BUF
     BUF -->|"32-bit AXIS<br/>1 packet = 1 frame"| S2MM
     S2MM --> RDDR
 
     style DDC fill:#e8f5e9,stroke:#34a853
-    style PLL fill:#e8f5e9,stroke:#34a853
     style MF fill:#e8f5e9,stroke:#34a853
-    style TR fill:#fff4e5,stroke:#f9ab00
-    style SL fill:#fff4e5,stroke:#f9ab00
-    style FS fill:#fff4e5,stroke:#f9ab00
-    style BUF fill:#fff4e5,stroke:#f9ab00
+    style TR fill:#e8f5e9,stroke:#34a853
+    style PLL fill:#e8f5e9,stroke:#34a853
+    style SL fill:#e8f5e9,stroke:#34a853
+    style FS fill:#e8f5e9,stroke:#34a853
+    style BUF fill:#e8f5e9,stroke:#34a853
 ```
 
-Green = simulated. Amber = built but unsimulated.
+Green = simulated. `tb_dsp.vhd` runs the full chain end to end (DDC through
+DMA S2MM) against a framed, impaired burst and now passes: 4/4 frames CRC-clean,
+4/4 sync detections, quality ratio 719/1000 (1000 = ideal, <700 = poor lock).
+
+**PLL moved to run AFTER Gardner, not right after the DDC.** Two things
+changed from the original design, in this order:
+
+1. Matched filter moved ahead of the PLL (`ddc → filter → pll → gardner`).
+   `pll_2nd_order`'s decision-directed detector is far noisier against raw,
+   not-yet-matched-filtered samples (every other 2 sps sample is a mid-symbol
+   transition point, not a peak) than against the filtered signal Gardner was
+   already getting. Measurable but modest (~13% tighter steady-state jitter).
+2. Gardner moved ahead of the PLL entirely (`ddc → filter → gardner → pll`).
+   The real fix for the noise in (1): even matched-filtered 2 sps samples are
+   still half off-peak. Gardner's TED is close to carrier-phase independent
+   by design (that's why it can bootstrap before anything is demodulated), so
+   it's safe to run it first and hand the PLL Gardner's recovered, always-
+   on-peak 1 sps symbols instead. `test_bench/loop_model.py`'s
+   `run_pll_pure_tone()` - the PLL against a single unmodulated tone, no data,
+   no Gardner - is what actually separates "loop mechanism" problems from
+   "data content" problems; it's how (1) was shown to be real but insufficient,
+   and how a THIRD, unrelated bug (next paragraph) was then found underneath it.
+
+**The PLL had a sign error, not a bandwidth problem.** `pd_proc` rotates the
+input FORWARD by `theta_nco` (`psi = phi_in + theta_nco`), not the standard
+DEROTATION (`psi = phi_in - theta_nco`) closed-form PLL design formulas
+assume. That sign difference means the detector's measured gain has to be
+NEGATED before deriving `K1`/`K2` - missed once, it produces a K1/K2 pair
+that passes every dead-zone/margin check (they don't check sign) while the
+real closed loop has positive, not negative, feedback. `run_pll_pure_tone()`
+caught it: wrong sign oscillates continuously across virtually the entire
+detector's range regardless of loop bandwidth, damping factor, or step-size
+clamping (none of those fix a sign error); negating both `K1` and `K2`
+collapsed that to a clean, textbook damped step response. See
+`pll_2nd_order.vhd`'s `K1`/`K2` comment and `loop_model.py`'s
+`characterize_pll_detector()` for the full derivation - the fix is applied at
+the source (the measured Kd is negated before any gain is derived from it),
+so a straight regenerate keeps the right sign automatically.
 
 ### 2.2 Stage reference
 
 | Stage | File | In → Out | Status |
 |---|---|---|---|
 | Downconversion | `ddc_fs_4.vhd` | real 4 sps → I/Q 2 sps | ✅ |
-| Carrier recovery | `pll_2nd_order.vhd` | I/Q 2 sps → I/Q 2 sps | ✅ |
 | Matched filter | `matched_filter_rrc.vhd` | I/Q 2 sps → I/Q 2 sps | ✅ |
-| Timing recovery | `timing_recovery_gardner.vhd` | I/Q 2 sps → I/Q 1 sps | 🟡 |
-| Hard decision | `qpsk_slicer.vhd` | 1 symbol → 2 bits | 🟡 |
-| Framing | `frame_sync.vhd` | bits → bytes + verdict | 🟡 |
-| Buffering | `rx_frame_buffer.vhd` | bytes → 32-bit packet | 🟡 |
+| Timing recovery | `timing_recovery_gardner.vhd` | I/Q 2 sps → I/Q 1 sps | ✅ |
+| Carrier recovery | `pll_2nd_order.vhd` | I/Q 1 sps → I/Q 1 sps | ✅ |
+| Hard decision | `qpsk_slicer.vhd` | 1 symbol → 2 bits | ✅ |
+| Framing | `frame_sync.vhd` | bits → bytes + verdict | ✅ |
+| Buffering | `rx_frame_buffer.vhd` | bytes → 32-bit packet | ✅ |
 
 All sample-path signals are **16-bit signed**. The chain is **sample-rate
 agnostic**: it advances one sample per `data_valid` strobe regardless of the
@@ -127,7 +164,10 @@ using nothing but sign flips (`{+x,0,-x,0}` / `{0,+x,0,-x}`), leaving
 loop is good at. Asking the PLL to acquire from DC all the way to fs/4 is the
 fragile case, and an earlier version that did exactly that (DDC and PLL as
 *alternative* branches rather than in series) fed the matched filter a signal
-still at the carrier.
+still at the carrier. The PLL itself has since moved twice more (matched
+filter, then Gardner, ahead of it) — see §2.1's note — but this coarse/fine
+split between the DDC and the PLL is unchanged; only what feeds the PLL
+between them moved.
 
 **2 sps is a Gardner requirement, not an arbitrary choice.** Gardner's timing
 error detector needs exactly two samples per symbol, which is why `ddc_fs_4`
@@ -189,17 +229,36 @@ path entirely untested.
 
 Both bugs above were found by this model before any RTL simulation ran.
 
+**`test_bench/loop_model.py`** is the companion model for the two loops
+`rx_model.py` deliberately skips — a bit-exact (fixed-point-accurate)
+Python model of `pll_2nd_order.vhd`'s and `timing_recovery_gardner.vhd`'s
+loop filters and detectors, built the same way `waveform_generator.py`
+designs the RRC taps: design in float from closed-form theory, quantize to
+the real fixed-point format, verify numerically, THEN emit VHDL constants.
+Run `python3 loop_model.py` for the full design/verification report, or
+`-plot`/`--plot` to additionally open live, zoomable traces of `phase_err`,
+`u`, `timing_err`, `mu`, and I/Q at each stage — useful for comparing
+sample-by-sample against a real RTL simulation waveform viewer. It's what
+found the PLL sign error (§2.1) and the Gardner self-noise pathology
+(§4.4): both were caught by `run_pll_pure_tone()`/`run_gardner_alternating()`
+isolating "loop mechanism" from "data content" problems, not by inspection.
+
 ### 2.5 Known gaps
 
-- Nothing downstream of the matched filter has been simulated in RTL (the
-  floating-point model covers the framing, not the loops).
-- **`pll_2nd_order` loop polarity needs re-confirming.** Correcting the DDC's Q
-  sign also flips the apparent sign of any residual frequency offset, so a loop
-  that converged against the old conjugated baseband may now diverge.
-- **Gardner loop polarity is unverified.** The adjustment is added to the phase
-  increment; whether that pulls the sampling instant toward or away from correct
-  depends on sign convention. If `timing_err` grows instead of settling toward
-  zero, negate `adj_v`. `G_K = 64` / `G_GAIN_FRAC = 24` are untuned.
+- **Resolved, was here as an open item:** the full chain (DDC through DMA
+  S2MM) is now simulated end to end by `tb_dsp.vhd` against a framed,
+  impaired burst - 4/4 frames CRC-clean, quality ratio 719/1000. Getting
+  there needed three separate fixes: a genuinely broken carrier phase
+  detector formula, a sign error in the PLL's loop-filter gains (see §2.1),
+  and a preamble bit pattern (`0xCCCCCCCC`) that turned out to trigger a
+  Gardner TED self-noise pathology - see §4.4. `test_bench/loop_model.py`
+  is the tool that found the last two; `test_bench/rx_model.py` still
+  covers the framing/CRC path independently (§2.4).
+- Gardner's timing resolution is still whole-sample-quantised (see the
+  bullet below) - correctly converged, not correctly precise. `G_K = 12578`
+  / `G_GAIN_FRAC = 16` are the loop_model.py-designed values, not untuned
+  placeholders, but the underlying whole-sample quantisation (mu -> Farrow
+  interpolator upgrade) is still open.
 - `pll_2nd_order` exports no `valid_out`; `dsp_top` compensates with a
   one-cycle delay that breaks silently if the PLL's pipelining changes.
 - No lock detector, so `STATUS.PLL_LOCKED` reads 0 permanently.
@@ -386,14 +445,17 @@ protocol. `reg_rw_interface`'s read state machine issues the BRAM read while
 still accepting the address, then holds one more cycle before the data is
 valid; the PS side sees ordinary AXI4-Lite wait states either way.
 
-**`CAPTURE_TAP` (`MODE[9:8]`) — four stages, matching the RX chain diagram:**
+**`CAPTURE_TAP` (`MODE[9:8]`) — four stages, matching the RX chain diagram.**
+Listed here in PIPELINE order; register values are NOT sequential in that
+order because the PLL moved (twice) after the tap constants were assigned -
+see `pkg.vhd`'s `C_TAP_*` comments:
 
-| Value | Tap | Answers |
-|---|---|---|
-| `00` | post-DDC | Is the carrier being removed at all? |
-| `01` | post-PLL | What is the matched filter actually receiving? |
-| `10` | post matched filter | Is the pulse shape/ISI what it should be? |
-| `11` | post-Gardner | Same point `rx_quality`'s ratio already summarizes — see it directly instead of inferring |
+| Value | Tap | Pipeline position | Answers |
+|---|---|---|---|
+| `00` | post-DDC | 1st | Is the carrier being removed at all? |
+| `10` | post matched filter | 2nd, before Gardner/PLL | Is the pulse shape/ISI what it should be? |
+| `11` | post-Gardner | 3rd, the PLL's input | Is timing recovery converging, independent of carrier lock? |
+| `01` | post-PLL | 4th, the slicer's input | Same point `rx_quality`'s ratio already summarizes — see it directly instead of inferring |
 
 **Packing:** I in the low 16 bits, Q in the high 16 bits of each word — the
 same convention the DMA payload packing already uses, so a hexdump of a
@@ -411,7 +473,7 @@ or eventually live traffic — not on its own. See 5.4 for how to run one from
 ┌──────────────┬──────────────┬────────────┬─────────────────┬────────────┐
 │  PREAMBLE    │  SYNC WORD   │   HEADER   │     PAYLOAD     │   CRC-16   │
 │  ≥32 bits    │   32 bits    │  16 bits   │   0–255 bytes   │  16 bits   │
-│  0xCCCCCCCC  │  0x1ACFFC1D  │            │                 │            │
+│  pseudorandom│  0x1ACFFC1D  │            │                 │            │
 └──────────────┴──────────────┴────────────┴─────────────────┴────────────┘
                                     │
                   ┌─────────────────┴─────────────────┐
@@ -420,17 +482,37 @@ or eventually live traffic — not on its own. See 5.4 for how to run one from
 ```
 
 - **PREAMBLE** is not searched for — it exists purely to give the carrier and
-  timing loops runway. Length is a transmit-side choice; the generator defaults
-  to 256 bits (128 symbols) rather than the nominal 32, because expecting two
-  feedback loops to settle inside 16 symbols is optimistic.
-- **The preamble is `0xCCCC…`, not `0xAAAA…`**, and the difference matters more
-  than it looks. Under this QPSK mapping `1010…` maps every symbol pair to the
-  *same constellation point*, and Gardner's error term
-  `(I[k] − I[k−1])·I[k−1/2]` is then identically zero — the timing loop gets no
-  error signal at all and cannot acquire. `1100…` alternates between two
-  antipodal points, giving a transition every symbol. Alternating bits are the
-  right instinct at the *bit* level; this constellation cares about the *symbol*
-  level.
+  timing loops runway. Length is a transmit-side choice; the generator
+  defaults to 512 bits (256 symbols) rather than the nominal 32, because
+  expecting two feedback loops to settle inside 16 symbols is optimistic (see
+  §2.1's note on the PLL's own settling time).
+- **The preamble content went through two designs, and the second one is the
+  current fix, not the first.**
+  - v1 (`0xAAAAAAAA`, `1010…`): every symbol pair maps to the *same*
+    constellation point, so Gardner's error term
+    `(I[k] − I[k−2])·I[k−1]` is identically zero — no timing information at
+    all, cannot acquire.
+  - v2 (`0xCCCCCCCC`, `1100…`): alternates between two antipodal points,
+    a transition every symbol — the obvious fix for v1's problem, and
+    correct for feeding the *carrier* loop plenty of transitions. But this
+    is an exact period-2 QPSK symbol pattern, and Gardner's TED has a
+    separate, well-documented failure mode against exactly that: "self-noise"
+    - nonzero average timing error even at PERFECT sampling. Confirmed
+      directly (not assumed) by `test_bench/loop_model.py`'s
+      `run_gardner_alternating()`: `incr` saturates at its ceiling against
+      this pattern even with ZERO timing offset and ZERO ppm, i.e. nothing
+      to correct. Doubling the preamble length to chase a different bug at
+      the time doubled the exposure to this and measurably WORSENED lock
+      quality (607 → 429 /1000) instead of helping — that regression is what
+      surfaced it.
+  - **Current: a fixed (seeded, reproducible) pseudorandom bit sequence**,
+    same statistical character as real payload data, which
+    `run_gardner_closed_loop()` already shows Gardner tracks cleanly. Still
+    gives the carrier loop plenty of transitions (long same-symbol runs are
+    short and rare in a random sequence) without the periodicity that trips
+    Gardner up. `test_bench/waveform_generator.py`'s `PREAMBLE_BITS` — costs
+    nothing in the receiver either way, since `frame_sync` hunts the sync
+    word, never the preamble.
 - **SYNC WORD** is the CCSDS attached sync marker. It provides frame alignment
   *and* resolves carrier phase ambiguity.
 - **CRC-16-CCITT**, poly `0x1021`, init `0xFFFF`, no final XOR, covering

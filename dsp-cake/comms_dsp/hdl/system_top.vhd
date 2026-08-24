@@ -19,9 +19,32 @@ use work.build_id_pkg.all;
 -- clock/reset) is internal between the block design wrapper and the PL
 -- logic, so it lives as signals rather than ports.
 --
--- Datapath:
---   PS DDR --(AXI DMA MM2S)--> mm2s_* --> dsp_top
---   dsp_top --> s2mm_* --(AXI DMA S2MM)--> PS DDR --> Linux --> Ethernet
+-- Datapath, and TWO clock domains, not one:
+--   PS DDR --(AXI DMA MM2S)--> mm2s_* [clk]
+--     --(axis_cdc_fifo)--> ADC_IN/data_valid [dsp_clk] --> dsp_top
+--     --(axis_cdc_fifo)--> s2mm_* [clk] --(AXI DMA S2MM)--> PS DDR --> Linux --> Ethernet
+--
+-- dsp_top runs on its own dedicated clock (dsp_clk, FCLK1, 1 MHz) rather
+-- than clk (FCLK0, the AXI/DMA side's clock, 40 MHz - a TIMING choice for
+-- the matched filter's DSP48 cascade, not a sample-rate one). Before this,
+-- data_valid was wired straight to mm2s_tvalid: the DSP chain advanced one
+-- sample per AXI-Stream beat, so the "sample rate" was really "however
+-- fast DMA happens to deliver bytes", not a chosen number, and
+-- mm2s_tready was hardwired '1' (no backpressure at all). The two
+-- axis_cdc_fifo.vhd instances below fix both: dsp_top now runs at a real,
+-- fs = 1 MHz sample rate (matching every constant already designed against
+-- fs = 1 MHz elsewhere - RRC taps, ddc_fs_4's fs/4 carrier placement, both
+-- loop_model.py-designed loop filters), decoupled from AXI/DMA throughput,
+-- with mm2s_tready now genuinely reflecting whether the FIFO has room.
+--
+-- reg_rw_interface and sample_sniffer stay on clk (FCLK0) - only the
+-- sample-processing chain moves. The sniffer's tap_* inputs cross domains
+-- through a plain 2-flop strobe synchronizer (see tap_sync_proc below), not
+-- another axis_cdc_fifo - they are diagnostic-only, continuously-driven
+-- signals from a MUCH slower source domain (dsp_clk, 1 MHz) sampled by a
+-- MUCH faster destination domain (clk, 40 MHz), so a full async FIFO would
+-- be needed only if losing an occasional diagnostic sample mattered, which
+-- for a monitoring tap it does not.
 entity system_top is
   generic (
     -- Where the DSP chain's sample strobe comes from. See valid_src_t in
@@ -59,6 +82,13 @@ architecture Behaviorial of system_top is
 signal clk         : std_logic;
 signal fclk_resetn : std_logic;                 -- active low, straight from PS7
 signal rst         : std_logic;                 -- active high, derived below
+
+-- dsp_top's own dedicated clock domain (FCLK1, 1 MHz - see the entity
+-- header comment). fclk1_resetn is PS7-native and already synchronized to
+-- fclk1, the same way fclk_resetn above is to fclk.
+signal dsp_clk         : std_logic;
+signal fclk1_resetn    : std_logic;
+signal dsp_rst         : std_logic;             -- active high, derived below
 
 -- AXI4-Lite: PS -> reg_rw_interface (user register space).
 -- Trimmed to the Lite subset only - the full-AXI4 burst/ID/cache/QoS
@@ -101,6 +131,44 @@ signal s2mm_tlast  : std_logic;
 signal s2mm_tvalid : std_logic;
 signal s2mm_tready : std_logic;
 
+-- CDC FIFO: MM2S [clk] -> dsp_top's ADC_IN [dsp_clk]. Just the 16-bit slice
+-- dsp_top actually consumes (see the existing TODO on the packing question
+-- below) - no need to carry the full 32-bit AXI word across.
+constant C_ADC_FIFO_DEPTH : natural := 1024;   -- matches sample_sniffer's
+                                                -- C_CAPTURE_DEPTH, plenty to
+                                                -- absorb DMA burstiness now
+                                                -- that mm2s_tready gives
+                                                -- real backpressure
+signal fifo_in_wr_full     : std_logic;
+signal fifo_in_wr_rst_busy : std_logic;
+signal fifo_in_rd_data     : std_logic_vector(15 downto 0);
+signal fifo_in_rd_empty    : std_logic;
+signal fifo_in_rd_rst_busy : std_logic;
+
+-- CDC FIFO: dsp_top's rx_t* [dsp_clk] -> S2MM [clk]. tdata/tkeep/tlast
+-- packed into one word so the frame's framing survives the crossing
+-- atomically - unpacked again on the read side.
+constant C_RX_FIFO_DEPTH : natural := 16;      -- one frame's worth of 32-bit
+                                                -- beats (C_MAX_PAYLOAD_WORDS
+                                                -- scale), not a bulk sample
+                                                -- stream
+signal fifo_out_wr_full     : std_logic;
+signal fifo_out_wr_rst_busy : std_logic;
+signal fifo_out_wr_data     : std_logic_vector(36 downto 0);   -- tdata & tkeep & tlast
+signal dsp_rx_tready        : std_logic;       -- dsp_top's rx_tready, driven
+                                                -- by this FIFO now instead
+                                                -- of s2mm_tready directly
+signal fifo_out_rd_data     : std_logic_vector(36 downto 0);
+signal fifo_out_rd_empty    : std_logic;
+signal fifo_out_rd_rst_busy : std_logic;
+
+-- dsp_top's own AXI-Stream-style RX output, in [dsp_clk] - separate from
+-- s2mm_t* now, which is the FIFO's read side in [clk].
+signal dsp_rx_tdata  : std_logic_vector(31 downto 0);
+signal dsp_rx_tkeep  : std_logic_vector(3 downto 0);
+signal dsp_rx_tlast  : std_logic;
+signal dsp_rx_tvalid : std_logic;
+
 signal dsp_valid  : std_logic;    -- sample strobe selected by G_VALID_SRC
 signal fpga_reg   : fpgaReg32;    -- PS -> PL, control words
 signal status_reg : fpgaStatus32; -- PL -> PS, read-only status/counters
@@ -120,18 +188,36 @@ signal rx_qual_syms   : unsigned(31 downto 0);
 
 -- Diagnostic sample sniffer (sample_sniffer.vhd) - see the "Diagnostic
 -- sample capture" section of pkg.vhd for the address map and register bits
--- this all hangs off. Taps come straight from dsp_top's new tap_* outputs;
--- the capture RAM read port is reached through reg_rw_interface's new
+-- this all hangs off. Taps come from dsp_top's tap_* outputs [dsp_clk
+-- domain] through tap_sync_proc's synchronizer into tap_*_sync [clk domain
+-- - sample_sniffer stays on clk, see the entity header comment]; the
+-- capture RAM read port is reached through reg_rw_interface's new
 -- capture_rd_* ports rather than a second AXI slave - see the note at the
 -- top of reg_rw_interface.vhd for why.
-signal tap_ddc_i, tap_ddc_q           : signed(15 downto 0);
-signal tap_ddc_valid                  : std_logic;
-signal tap_pll_i, tap_pll_q           : signed(15 downto 0);
-signal tap_pll_valid                  : std_logic;
-signal tap_filtered_i, tap_filtered_q : signed(15 downto 0);
-signal tap_filtered_valid             : std_logic;
-signal tap_sym_i, tap_sym_q           : signed(15 downto 0);
-signal tap_sym_valid                  : std_logic;
+signal tap_ddc_i, tap_ddc_q           : signed(15 downto 0);   -- [dsp_clk]
+signal tap_ddc_valid                  : std_logic;             -- [dsp_clk]
+signal tap_pll_i, tap_pll_q           : signed(15 downto 0);   -- [dsp_clk]
+signal tap_pll_valid                  : std_logic;             -- [dsp_clk]
+signal tap_filtered_i, tap_filtered_q : signed(15 downto 0);   -- [dsp_clk]
+signal tap_filtered_valid             : std_logic;             -- [dsp_clk]
+signal tap_sym_i, tap_sym_q           : signed(15 downto 0);   -- [dsp_clk]
+signal tap_sym_valid                  : std_logic;             -- [dsp_clk]
+
+-- Synchronized into [clk] by tap_sync_proc - what sample_sniffer actually
+-- reads. Data registers are single-flopped, continuously (not gated) - see
+-- the entity header comment for why that is safe here (slow source domain,
+-- much faster destination domain sampling it, data held stable for ~40
+-- destination cycles between source updates). Only the *_valid strobes get
+-- the full 2-flop synchronizer, since those are the signals sample_sniffer
+-- actually edge-detects.
+signal tap_ddc_i_sync, tap_ddc_q_sync           : signed(15 downto 0);
+signal tap_ddc_valid_s1, tap_ddc_valid_sync     : std_logic;
+signal tap_pll_i_sync, tap_pll_q_sync           : signed(15 downto 0);
+signal tap_pll_valid_s1, tap_pll_valid_sync     : std_logic;
+signal tap_filtered_i_sync, tap_filtered_q_sync : signed(15 downto 0);
+signal tap_filtered_valid_s1, tap_filtered_valid_sync : std_logic;
+signal tap_sym_i_sync, tap_sym_q_sync           : signed(15 downto 0);
+signal tap_sym_valid_s1, tap_sym_valid_sync     : std_logic;
 
 signal capture_arm     : std_logic;    -- one-clock pulse from a CONTROL write
 signal capture_done    : std_logic;
@@ -181,6 +267,10 @@ end process;
 -- register block wants active low. Derive both rather than passing one
 -- signal into ports of opposite polarity (which the old version did).
 rst <= not fclk_resetn;
+
+-- dsp_top's own reset, in its own [dsp_clk] domain - same active-high
+-- derivation as rst abovefclk_resetn.
+dsp_rst <= not fclk_resetn;
 
 ps_i : entity work.system_wrapper
   port map (
@@ -239,39 +329,72 @@ ps_i : entity work.system_wrapper
     ,S_AXIS_S2MM_0_tready => s2mm_tready
     ,fclk                 => clk
     ,fclk_resetn          => fclk_resetn
+    ,fclk1                => dsp_clk
   );
 
--- TODO: the DSP chain has no backpressure path yet - it consumes one sample
--- per data_valid unconditionally - so the MM2S stream is always accepted.
--- Give dsp_top a tready once any stage can stall.
-mm2s_tready <= '1';
-
+-- MM2S -> dsp_top CDC FIFO. wr_en is qualified by "not full" (never write
+-- into a full FIFO, even momentarily); mm2s_tready is driven the same way,
+-- independently, so the DMA engine sees real backpressure rather than the
+-- old hardwired '1' - this finally closes the backpressure TODO that used
+-- to be here. Held low during wr_rst_busy too: the FIFO is not ready to
+-- accept writes until its own reset sequencing (spanning both clock
+-- domains) completes.
+--
 -- TODO: 32-bit stream carrying 16-bit I/Q - taking the low half for now to
 -- match dsp_top's 16-bit ADC_IN. Decide the packing (interleaved samples vs
--- I in low half / Q in high half) and slice accordingly.
--- Sample strobe selection. The DSP chain advances one sample per pulse, so
--- this sets the effective sample rate without any clock conversion.
--- VALID_ADC has no source yet - add the port when the ADC path exists.
-dsp_valid <= mm2s_tvalid when G_VALID_SRC = VALID_DMA else
-             '1'         when G_VALID_SRC = VALID_ALWAYS else
+-- I in low half / Q in high half) and slice accordingly. Unchanged by this
+-- CDC work - still a real open question, just now on the FIFO's write side
+-- instead of directly on mm2s_tdata.
+mm2s_tready <= (not fifo_in_wr_full) and (not fifo_in_wr_rst_busy);
+
+fifo_in_i : entity work.axis_cdc_fifo
+  generic map (
+     G_DATA_WIDTH => 16
+    ,G_DEPTH      => C_ADC_FIFO_DEPTH
+  )
+  port map (
+     wr_clk      => clk
+    ,wr_rst      => rst
+    ,wr_en       => mm2s_tvalid and (not fifo_in_wr_full) and (not fifo_in_wr_rst_busy)
+    ,wr_data     => mm2s_tdata(15 downto 0)
+    ,wr_full     => fifo_in_wr_full
+    ,wr_rst_busy => fifo_in_wr_rst_busy
+
+    ,rd_clk      => dsp_clk
+    ,rd_rst      => dsp_rst
+    ,rd_en       => not fifo_in_rd_empty
+    ,rd_data     => fifo_in_rd_data
+    ,rd_empty    => fifo_in_rd_empty
+    ,rd_rst_busy => fifo_in_rd_rst_busy
+  );
+
+-- Sample strobe selection, now against the FIFO's read side rather than
+-- mm2s_tvalid directly - dsp_top advances one sample per dsp_clk tick
+-- whenever the FIFO has one ready, which at fs = 1 MHz is exactly the real
+-- sample rate this chain was designed against (see the entity header
+-- comment). VALID_ADC has no source yet - add the port when the ADC path
+-- exists.
+dsp_valid <= (not fifo_in_rd_empty) when G_VALID_SRC = VALID_DMA else
+             '1'                    when G_VALID_SRC = VALID_ALWAYS else
              '0';
 
 uut : entity work.dsp_top
   port map (
-     SYS_CLK     => clk
-    ,ARST        => rst
-    ,ADC_IN      => signed(mm2s_tdata(15 downto 0))
+     SYS_CLK     => dsp_clk
+    ,ARST        => dsp_rst
+    ,ADC_IN      => signed(fifo_in_rd_data)
     ,data_valid  => dsp_valid
 
     ,rx_enable   => fpga_reg(C_REG_CONTROL)(C_CTRL_RX_ENABLE)
     ,clr_stats   => clr_stats
 
-    -- recovered frames back to DDR
-    ,rx_tdata    => s2mm_tdata
-    ,rx_tkeep    => s2mm_tkeep
-    ,rx_tlast    => s2mm_tlast
-    ,rx_tvalid   => s2mm_tvalid
-    ,rx_tready   => s2mm_tready
+    -- recovered frames -> the CDC FIFO back to clk/S2MM below, not
+    -- directly to s2mm_t* any more
+    ,rx_tdata    => dsp_rx_tdata
+    ,rx_tkeep    => dsp_rx_tkeep
+    ,rx_tlast    => dsp_rx_tlast
+    ,rx_tvalid   => dsp_rx_tvalid
+    ,rx_tready   => dsp_rx_tready
 
     ,frame_count => rx_frame_count
     ,err_count   => rx_err_count
@@ -284,7 +407,8 @@ uut : entity work.dsp_top
     ,qual_max    => rx_qual_max
     ,qual_syms   => rx_qual_syms
 
-    -- sniffer taps
+    -- sniffer taps - [dsp_clk], synchronized into [clk] by tap_sync_proc
+    -- below before sample_sniffer (which stays on clk) sees them
     ,tap_ddc_i         => tap_ddc_i
     ,tap_ddc_q         => tap_ddc_q
     ,tap_ddc_valid     => tap_ddc_valid
@@ -298,6 +422,82 @@ uut : entity work.dsp_top
     ,tap_sym_q         => tap_sym_q
     ,tap_sym_valid     => tap_sym_valid
   );
+
+-- dsp_top's RX output -> S2MM CDC FIFO. Packs tdata/tkeep/tlast into one
+-- word so they cross atomically; rx_frame_buffer's existing valid/ready
+-- contract (see rx_frame_buffer.vhd - it already waits on m_tready before
+-- advancing) is preserved unchanged, just now against this FIFO instead of
+-- directly against s2mm_t*.
+fifo_out_wr_data <= dsp_rx_tdata & dsp_rx_tkeep & dsp_rx_tlast;
+dsp_rx_tready    <= (not fifo_out_wr_full) and (not fifo_out_wr_rst_busy);
+
+fifo_out_i : entity work.axis_cdc_fifo
+  generic map (
+     G_DATA_WIDTH => 37
+    ,G_DEPTH      => C_RX_FIFO_DEPTH
+  )
+  port map (
+     wr_clk      => dsp_clk
+    ,wr_rst      => dsp_rst
+    ,wr_en       => dsp_rx_tvalid and (not fifo_out_wr_full) and (not fifo_out_wr_rst_busy)
+    ,wr_data     => fifo_out_wr_data
+    ,wr_full     => fifo_out_wr_full
+    ,wr_rst_busy => fifo_out_wr_rst_busy
+
+    ,rd_clk      => clk
+    ,rd_rst      => rst
+    ,rd_en       => (not fifo_out_rd_empty) and s2mm_tready
+    ,rd_data     => fifo_out_rd_data
+    ,rd_empty    => fifo_out_rd_empty
+    ,rd_rst_busy => fifo_out_rd_rst_busy
+  );
+
+s2mm_tdata  <= fifo_out_rd_data(36 downto 5);
+s2mm_tkeep  <= fifo_out_rd_data(4 downto 1);
+s2mm_tlast  <= fifo_out_rd_data(0);
+s2mm_tvalid <= not fifo_out_rd_empty;
+
+-- Diagnostic sniffer tap synchronizer: dsp_top's tap_* outputs [dsp_clk,
+-- 1 MHz] into sample_sniffer's inputs [clk, 40 MHz]. Data registers are
+-- single-flopped continuously (not gated by valid) - safe here because the
+-- source domain is much slower than the destination sampling it (~40 clk
+-- cycles of stable data between each dsp_clk update), so by the time
+-- *_valid_sync (the fully-resolved output of the 2-flop strobe
+-- synchronizer) asserts, the corresponding data has long since settled -
+-- see the entity header comment for the full reasoning. Only *_valid gets
+-- the proper 2-flop synchronizer, since that is the signal sample_sniffer
+-- actually edge-detects.
+tap_sync_proc : process (clk)
+begin
+    if rising_edge(clk) then
+        if rst = '1' then
+            tap_ddc_valid_s1 <= '0'; tap_ddc_valid_sync <= '0';
+            tap_pll_valid_s1 <= '0'; tap_pll_valid_sync <= '0';
+            tap_filtered_valid_s1 <= '0'; tap_filtered_valid_sync <= '0';
+            tap_sym_valid_s1 <= '0'; tap_sym_valid_sync <= '0';
+        else
+            tap_ddc_valid_s1   <= tap_ddc_valid;
+            tap_ddc_valid_sync <= tap_ddc_valid_s1;
+            tap_ddc_i_sync     <= tap_ddc_i;
+            tap_ddc_q_sync     <= tap_ddc_q;
+
+            tap_pll_valid_s1   <= tap_pll_valid;
+            tap_pll_valid_sync <= tap_pll_valid_s1;
+            tap_pll_i_sync     <= tap_pll_i;
+            tap_pll_q_sync     <= tap_pll_q;
+
+            tap_filtered_valid_s1   <= tap_filtered_valid;
+            tap_filtered_valid_sync <= tap_filtered_valid_s1;
+            tap_filtered_i_sync     <= tap_filtered_i;
+            tap_filtered_q_sync     <= tap_filtered_q;
+
+            tap_sym_valid_s1   <= tap_sym_valid;
+            tap_sym_valid_sync <= tap_sym_valid_s1;
+            tap_sym_i_sync     <= tap_sym_i;
+            tap_sym_q_sync     <= tap_sym_q;
+        end if;
+    end if;
+end process;
 
 reg_inst : entity work.reg_rw_interface
   port map (
@@ -337,21 +537,24 @@ sniffer_inst : entity work.sample_sniffer
      clk => clk
     ,rst => rst
 
-    ,ddc_i     => tap_ddc_i
-    ,ddc_q     => tap_ddc_q
-    ,ddc_valid => tap_ddc_valid
+    -- Synchronized tap_*_sync signals (tap_sync_proc above), not dsp_top's
+    -- raw tap_* outputs directly - those are in [dsp_clk], sample_sniffer
+    -- is in [clk].
+    ,ddc_i     => tap_ddc_i_sync
+    ,ddc_q     => tap_ddc_q_sync
+    ,ddc_valid => tap_ddc_valid_sync
 
-    ,pll_i     => tap_pll_i
-    ,pll_q     => tap_pll_q
-    ,pll_valid => tap_pll_valid
+    ,pll_i     => tap_pll_i_sync
+    ,pll_q     => tap_pll_q_sync
+    ,pll_valid => tap_pll_valid_sync
 
-    ,filtered_i     => tap_filtered_i
-    ,filtered_q     => tap_filtered_q
-    ,filtered_valid => tap_filtered_valid
+    ,filtered_i     => tap_filtered_i_sync
+    ,filtered_q     => tap_filtered_q_sync
+    ,filtered_valid => tap_filtered_valid_sync
 
-    ,sym_i     => tap_sym_i
-    ,sym_q     => tap_sym_q
-    ,sym_valid => tap_sym_valid
+    ,sym_i     => tap_sym_i_sync
+    ,sym_q     => tap_sym_q_sync
+    ,sym_valid => tap_sym_valid_sync
 
     ,tap_sel => fpga_reg(C_REG_MODE)(C_MODE_CAPTURE_TAP_RANGE)
 

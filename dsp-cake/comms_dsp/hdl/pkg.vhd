@@ -103,11 +103,17 @@ subtype  C_MODE_SPREAD_RANGE is natural range 7 downto 4;
 -- enum - consistent with MOD_RANGE/SPREAD_RANGE above, both plain
 -- PS-writable fields rather than something decided at synthesis time (that
 -- is what the generics/valid_src_t enum are for).
+-- Chain order (see dsp_top.vhd): ddc -> filtered -> gardner (sym) -> pll.
+-- PLL moved to run on Gardner's output, not the other way around, so
+-- tap_sym sits BEFORE tap_pll in the pipeline now - the reverse of the
+-- original ddc -> pll -> filtered -> sym order these two-letter comments
+-- described. Constant NAMES and VALUES are unchanged (register-map
+-- compatible); only what each one is downstream of changed.
 subtype  C_MODE_CAPTURE_TAP_RANGE is natural range 9 downto 8;
 constant C_TAP_DDC       : std_logic_vector(1 downto 0) := "00";  -- post-DDC
-constant C_TAP_PLL       : std_logic_vector(1 downto 0) := "01";  -- post-PLL, matched filter's input
-constant C_TAP_FILTERED  : std_logic_vector(1 downto 0) := "10";  -- post matched filter
-constant C_TAP_SYM       : std_logic_vector(1 downto 0) := "11";  -- post-Gardner, slicer's input
+constant C_TAP_PLL       : std_logic_vector(1 downto 0) := "01";  -- post-PLL, the slicer's input
+constant C_TAP_FILTERED  : std_logic_vector(1 downto 0) := "10";  -- post matched filter, BEFORE Gardner/PLL
+constant C_TAP_SYM       : std_logic_vector(1 downto 0) := "11";  -- post-Gardner (= PLL's input), BEFORE the PLL now
 
 -- STATUS bit positions (driven from PL)
 constant C_STAT_TX_BUSY     : natural := 0;

@@ -29,12 +29,32 @@ end test_dsp_top;
 
 architecture sim of test_dsp_top is
 
-    -- Clock period for 100 MHz
-    constant clk_period : time := 10 ns;
+    -- Simulation-only clock, decoupled from the real design's clocking
+    -- (dsp_top is fed directly here, bypassing system_top.vhd/dsp_clk/the
+    -- CDC FIFOs entirely - see system_top.vhd's entity header comment).
+    -- dsp_top's own loop filters are purely SAMPLE-driven, not real-time-
+    -- driven - every process reacts only to data_valid pulses, with no
+    -- notion of "seconds" anywhere in the RTL. The "fs = 1 MHz" the loop
+    -- coefficients (test_bench/loop_model.py) are designed against is an
+    -- assumption baked into ddc_input.dat's actual SAMPLE VALUES (carrier
+    -- placement, freq_err_hz, ppm, all computed against FS = 1_000_000 in
+    -- waveform_generator.py), not into this clock's period - feed the same
+    -- samples one-per-data_valid-pulse and the loop dynamics under test are
+    -- bit-for-bit identical regardless of clk_period. Set to 1 us here so
+    -- the simulator's own reported Time: values read out AS real sample
+    -- timing (useful for correlating against radiomon/hardware captures),
+    -- not because a different value would test different behaviour.
+    constant clk_period : time := 1 us;
 
-    -- ddc_input.dat is ~4100 samples at one sample per clock = ~41 us, plus
-    -- chain latency and time for the last frame to drain through the buffer.
-    constant sim_time : time := 100 us;
+    -- Sized in CYCLES (via clk_period), not a fixed absolute time - the
+    -- previous version (100 us flat) silently assumed clk_period stayed
+    -- near its old ~100 ns value forever, and broke (simulation never
+    -- reaching sim_done) the moment it didn't. 7000 cycles covers the
+    -- current stimulus (ddc_input.dat is 6140 samples - `wc -l
+    -- ddc_input.dat` to recheck after regenerating it) plus margin for
+    -- chain latency and the last frame draining through the buffer. Bump
+    -- this if the stimulus grows past ~6500 samples.
+    constant sim_time : time := 7000 * clk_period;
 
     constant EXPECTED_FRAMES : natural := 4;
 
@@ -257,8 +277,11 @@ begin
 
         wait until stim_done = '1';
         -- let the tail of the chain drain: filter, loops, and the frame buffer
-        -- readout all sit behind the last input sample
-        wait for 2 us;
+        -- readout all sit behind the last input sample. 20 cycles (was a
+        -- flat "2 us", which meant something different at every clk_period
+        -- - see clk_period's own comment above for why that class of bug
+        -- keeps recurring here).
+        wait for 20 * clk_period;
 
         write(l, string'("[TB] ---- results ----"));                 writeline(output, l);
         write(l, string'("[TB] frames passing CRC : "));

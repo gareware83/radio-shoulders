@@ -172,6 +172,31 @@ apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 -config $automat
 # the hardware actually runs at comes from assigned-clock-rates in
 # board/common/zynq-zybo-z7-radio.dts. The two must be changed together or the
 # timing report stops describing the board.
+#
+# FCLK1 = 1 MHz, a SECOND, independent PL clock - not a peripheral rate,
+# dsp_top's own sample clock. Until now dsp_top ran on FCLK0 and its
+# data_valid was just gated by mm2s_tvalid, so "sample rate" was really
+# "however fast DMA happens to deliver AXI-Stream beats", not a chosen
+# number. Every constant already designed in this codebase (RRC taps,
+# ddc_fs_4's fs/4 carrier placement, both PLL/Gardner loop filters in
+# test_bench/loop_model.py) assumes fs = 1 MHz, so that is what FCLK1 is set
+# to - dsp_top gets a real, dedicated sample clock instead of inheriting
+# whatever FCLK0 happens to be, decoupled from the AXI/DMA side via
+# axis_cdc_fifo.vhd in system_top.vhd. See docs/system_design.md's
+# clock-domain note for the full reasoning.
+#
+# CONFIG.PCW_FPGA1_PERIPHERAL_FREQMHZ alone sets the requested rate, but
+# does NOT bring the output out - confirmed the hard way: PCW_EN_CLK1_PORT
+# and PCW_FPGA_FCLK1_ENABLE both read '1' by default once the frequency is
+# set (so the clock exists, correctly divided down to 1 MHz), but
+# PCW_FCLK_CLK1_BUF read FALSE - the actual output buffer was never
+# enabled, so FCLK_CLK1/fclk1/dsp_clk never toggled. That's what a hung
+# simulation was actually reporting: dsp_top never saw a clock edge, so it
+# never advanced past its first sample. PCW_FCLK_CLK1_BUF {TRUE} is the
+# fix - as with FCLK0's own tuning earlier in this project, if a later
+# Vivado release renames this, `report_property [get_bd_cells
+# processing_system7_0] -regexp {.*CLK1.*}` after this script runs will
+# show the real property names for that version rather than this comment.
 set_property -dict [list \
     CONFIG.PCW_USE_M_AXI_GP0 {1} \
     CONFIG.PCW_USE_M_AXI_GP1 {1} \
@@ -180,6 +205,8 @@ set_property -dict [list \
     CONFIG.PCW_USE_FABRIC_INTERRUPT {1} \
     CONFIG.PCW_IRQ_F2P_INTR {1} \
     CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {40} \
+    CONFIG.PCW_FPGA1_PERIPHERAL_FREQMHZ {1} \
+    CONFIG.PCW_FCLK_CLK1_BUF {TRUE} \
 ] $ps
 
 # --- AXI DMA: PL <-> PS DDR bulk data path -------------------------------
@@ -399,6 +426,19 @@ connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0] [get_bd_ports fclk]
 create_bd_port -dir O -type rst fclk_resetn
 connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_ports fclk_resetn]
 
+# dsp_top's own dedicated sample clock (see the FCLK1 comment above
+# PCW_FPGA1_PERIPHERAL_FREQMHZ). Deliberately NOT given an ASSOCIATED_BUSIF
+# below - it drives nothing PS7-facing, only axis_cdc_fifo.vhd's read side
+# and dsp_top itself, both in system_top.vhd. FCLK_RESET1_N is PS7-native
+# and already synchronized to FCLK_CLK1, the same way FCLK_RESET0_N above is
+# used directly rather than through proc_sys_reset_0 (that instance stays
+# scoped to the AXI infrastructure it already serves).
+create_bd_port -dir O -type clk fclk1
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK1] [get_bd_ports fclk1]
+
+create_bd_port -dir O -type rst fclk1_resetn
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET1_N] [get_bd_ports fclk1_resetn]
+
 # --- Port parameters, set AFTER connecting -------------------------------
 # Explicitly created ports default to 100 MHz / 1-byte TDATA / AXI4, none of
 # which match the IP side. Setting these before connecting doesn't stick -
@@ -412,6 +452,15 @@ set_property -dict [list \
     CONFIG.FREQ_HZ $pl_freq \
     CONFIG.ASSOCIATED_BUSIF {M_AXIS_MM2S_0:S_AXIS_S2MM_0:M_AXI_REGS_0} \
 ] [get_bd_ports fclk]
+
+# dsp_clk's own rate - no ASSOCIATED_BUSIF, see the port-creation comment
+# above for why.
+set dsp_freq [get_property CONFIG.FREQ_HZ [get_bd_pins processing_system7_0/FCLK_CLK1]]
+if { $dsp_freq eq "" } { set dsp_freq 1000000 }
+
+set_property -dict [list \
+    CONFIG.FREQ_HZ $dsp_freq \
+] [get_bd_ports fclk1]
 
 set axis_props [list \
     CONFIG.FREQ_HZ $pl_freq \
@@ -487,6 +536,18 @@ add_files -norecurse $wrapper
 update_compile_order -fileset sources_1
 set_property top system_top [get_filesets sources_1]
 update_compile_order -fileset sources_1
+
+# --- Clock-domain-crossing constraints ------------------------------------
+# The FIRST hand-authored constraint this project has needed: until dsp_clk
+# (FCLK1) existed, everything ran off FCLK0 and Vivado's automatic clock
+# derivation from the PS7 BD cell was sufficient - no XDC file was ever
+# required. Checked in (not generated here) so a project maintained by hand
+# between regenerations - add_files this same path directly, see the file's
+# own header - stays in sync with what a fresh create_project.tcl run
+# produces, rather than the two drifting apart.
+set cdc_xdc "$script_dir/constraints/system_top_cdc.xdc"
+add_files -fileset constrs_1 -norecurse $cdc_xdc
+set_property target_constrs_file $cdc_xdc [current_fileset -constrset]
 
 puts "Project created: $project_dir/$project_name.xpr"
 # --- Address map sanity check -------------------------------------------

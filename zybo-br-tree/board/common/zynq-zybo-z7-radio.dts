@@ -47,13 +47,27 @@
  * timing report describes a board that does not exist.
  *
  * It was 50 MHz, where the design missed timing by 1.017 ns on 96 endpoints
- * in the matched filter's DSP48 cascade. Nothing here needs a particular
- * fabric clock: the DSP chain advances one sample per data_valid strobe, so
- * the sample rate is set by how often that fires, not by this.
+ * in the matched filter's DSP48 cascade. FCLK0 itself is a TIMING choice,
+ * not a sample-rate one - it clocks the AXI/DMA side (UIO devices below),
+ * not dsp_top.
+ *
+ * FCLK1 (clkc id 16) is dsp_top's own dedicated sample clock, added
+ * alongside FCLK0 rather than replacing it - see system_top.vhd's
+ * axis_cdc_fifo instances and create_project.tcl's PCW_FPGA1_PERIPHERAL_
+ * FREQMHZ comment. 1 MHz matches every constant already designed against
+ * fs = 1 MHz elsewhere in this codebase (RRC taps, ddc_fs_4's fs/4 carrier
+ * placement, both loop_model.py-designed loop filters) - THIS is what
+ * actually sets the DSP chain's sample rate now, unlike FCLK0.
+ *
+ * Same clk_ignore_unused caveat applies to FCLK1 as FCLK0 (see the bootargs
+ * note elsewhere in this file / docs/zybo_work.md's "clk_ignore_unused"
+ * section) - no in-kernel driver claims either clock, and clk_ignore_unused
+ * is what stops the kernel gating them off as a result. No dedicated UIO
+ * consumer node is needed for FCLK1 just to keep it alive.
  */
 &clkc {
-	assigned-clocks = <&clkc 15>;
-	assigned-clock-rates = <40000000>;
+	assigned-clocks = <&clkc 15>, <&clkc 16>;
+	assigned-clock-rates = <40000000>, <1000000>;
 };
 
 &amba {
