@@ -225,8 +225,19 @@ set_property -dict [list \
 # the length, poll for done" - three registers instead of a descriptor
 # allocator and a coherency protocol for the descriptors themselves.
 #
-# Simple mode caps a transfer at 2**26-1 bytes, which is far more than a frame
-# or any stimulus buffer being pushed the other way.
+# Simple mode's transfer-length register width is c_sg_length_width, set
+# explicitly below to 23 bits (max 2**23-1 = 8388607 bytes) - the IP's own
+# default is only 14 bits (max 16383 bytes) when this isn't overridden, which
+# is NOT "far more than any stimulus buffer": a 6140-sample/24560-byte
+# whole-file loopback transfer overflows a 14-bit length register and wraps
+# silently (24560 mod 16384 = 8176 bytes = 2044 samples transferred, the
+# rest of the request just never happens - no error, no DMASR flag, nothing
+# to notice short of a sample-count mismatch downstream). Confirmed via the
+# synthesized IP's own .xci (system_axi_dma_0_0.xci): c_sg_length_width was
+# "14" here, not overridden - this comment used to claim 2**26-1 on the
+# strength of Simple mode's separately-documented absolute maximum, which is
+# real but irrelevant - it doesn't apply unless c_sg_length_width is actually
+# widened to claim it, which it wasn't.
 set dma_vlnv [get_ipdefs -filter {NAME == axi_dma} -all]
 set dma [create_bd_cell -type ip -vlnv [lindex $dma_vlnv 0] axi_dma_0]
 #
@@ -252,6 +263,7 @@ set_property -dict [list \
     CONFIG.c_s_axis_s2mm_tdata_width {32} \
     CONFIG.c_mm2s_burst_size {16} \
     CONFIG.c_s2mm_burst_size {16} \
+    CONFIG.c_sg_length_width {23} \
 ] $dma
 
 # --- AXI4-Lite bridge out to the PL register block -----------------------
@@ -429,15 +441,25 @@ connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_ports fc
 # dsp_top's own dedicated sample clock (see the FCLK1 comment above
 # PCW_FPGA1_PERIPHERAL_FREQMHZ). Deliberately NOT given an ASSOCIATED_BUSIF
 # below - it drives nothing PS7-facing, only axis_cdc_fifo.vhd's read side
-# and dsp_top itself, both in system_top.vhd. FCLK_RESET1_N is PS7-native
-# and already synchronized to FCLK_CLK1, the same way FCLK_RESET0_N above is
-# used directly rather than through proc_sys_reset_0 (that instance stays
-# scoped to the AXI infrastructure it already serves).
+# and dsp_top itself, both in system_top.vhd.
+#
+# Unlike FCLK0, the PS7 IP has no native FCLK_RESET1_N pin - only FCLK0 gets
+# a dedicated reset output. So fclk1_resetn can't just tap a PS7 pin the way
+# fclk_resetn does above; it needs its own proc_sys_reset instance to
+# synchronize a reset source into the FCLK_CLK1 domain, exactly like
+# proc_sys_reset_0 already does for the AXI infrastructure above.
+# FCLK_RESET0_N (PS7-native, already valid) is used as the ext_reset_in
+# source - proc_sys_reset_1 takes care of resynchronizing/holding it for the
+# FCLK_CLK1 domain.
 create_bd_port -dir O -type clk fclk1
 connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK1] [get_bd_ports fclk1]
 
+set rstgen1 [create_bd_cell -type ip -vlnv [lindex $rst_vlnv 0] proc_sys_reset_1]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK1]     [get_bd_pins proc_sys_reset_1/slowest_sync_clk]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_pins proc_sys_reset_1/ext_reset_in]
+
 create_bd_port -dir O -type rst fclk1_resetn
-connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET1_N] [get_bd_ports fclk1_resetn]
+connect_bd_net [get_bd_pins proc_sys_reset_1/peripheral_aresetn] [get_bd_ports fclk1_resetn]
 
 # --- Port parameters, set AFTER connecting -------------------------------
 # Explicitly created ports default to 100 MHz / 1-byte TDATA / AXI4, none of

@@ -1,0 +1,45 @@
+#!/bin/sh
+#
+# Force-step the clock again, late in boot.
+#
+# S49ntp already does this once, right after networking (S40) and the data
+# partition mount (S41) come up - see that script's own comment for why a
+# step (not a slew) is needed at all. That timing isn't reliably late enough
+# on this board: the clock is sometimes still unset after S49ntp reports
+# FAILED, needing a manual `ntpd -q -n -p ...` after login to actually take
+# effect. This is a stopgap for that, not a fix for whatever makes the first
+# attempt unreliable - the delay before the server becomes reachable seems
+# indeterminate (a few tries, not a fixed amount of time), so this retries
+# in a bounded loop rather than once, spaced out to cover a boot-time delay
+# without looping forever if the server is genuinely unreachable.
+#
+# One-shot only: no daemon to start/stop, S49ntp already owns that.
+
+NAME=ntpd-restep
+NTP_SERVER=10.0.0.192
+[ -r /etc/default/ntp ] && . /etc/default/ntp
+
+MAX_TRIES=5
+RETRY_DELAY=3
+
+start() {
+	printf "Re-stepping clock from %s" "$NTP_SERVER"
+	i=1
+	while [ "$i" -le "$MAX_TRIES" ]; do
+		printf " (try %d/%d)" "$i" "$MAX_TRIES"
+		if timeout 10 ntpd -q -n -p "$NTP_SERVER" >/dev/null 2>&1; then
+			echo ": OK ($(date))"
+			return 0
+		fi
+		i=$((i + 1))
+		[ "$i" -le "$MAX_TRIES" ] && sleep "$RETRY_DELAY"
+	done
+	echo ": FAILED after $MAX_TRIES tries - clock left at $(date)"
+}
+
+case "$1" in
+	start)          start ;;
+	stop)           : ;;
+	restart|reload) start ;;
+	*)              echo "Usage: $0 {start|stop|restart}" ; exit 1 ;;
+esac

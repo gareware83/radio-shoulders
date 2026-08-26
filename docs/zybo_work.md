@@ -1463,6 +1463,62 @@ Changing the busybox config requires `make busybox-rebuild`, or the applet set i
 
 Live state at the end of the last working session. Nothing here is settled.
 
+### -1. RESOLVED: hardware now matches simulation — 4/4 frames, quality 720/1000
+
+**The board now reproduces `tb_dsp.vhd`'s simulated result almost exactly.**
+`radioctl loopback` (whole file, no `--chunks`) reports:
+
+```
+frames      4 passed CRC
+errors      0 failed CRC
+syncs       4 sync-word detections
+quality     0.720 over 1534 symbols
+captured    1 of 1 chunks
+```
+
+against sim's `4/4 frames, quality 719/1000` on the same stimulus - the
+DSP chain itself was never the problem on hardware; every symptom this whole
+"WHERE THINGS STAND" section and the `dsp_clk` CDC work below describe
+(poor lock, 0/4 frames, non-repeatable runs, `S2MM_DMASR` never leaving
+`0x00000000`) traces to a single root cause, found last via a hardware ILA
+capture cross-compared sample-for-sample against a new `test_dsp_top.vhd`
+trace-dump (see "Hardware debug: ILA + sim trace comparison" below):
+
+**`axi_dma_0`'s `c_sg_length_width` was left at its IP default of 14 bits
+(max 16383 bytes) instead of being sized for the actual transfer.** A
+whole-file loopback transfer is 6140 samples × 4 bytes = 24560 bytes -
+writing that into a 14-bit length register doesn't error, it silently wraps:
+`24560 mod 16384 = 8176 bytes = 2044 samples`. The ILA showed exactly this:
+`dsp_valid` a clean, gap-free burst of exactly 2044 samples then dead
+silence for the rest of the capture - not a lock/convergence failure, the
+DMA simply never delivered the rest of the file. `--chunks`'s per-chunk
+sizes (5912-6144 bytes each) happened to stay under the 16383-byte limit,
+which is almost certainly why chunked runs got further than whole-file
+runs without anyone realizing why. Fixed by setting
+`CONFIG.c_sg_length_width {23}` on `axi_dma_0` in `create_project.tcl`
+(max 2**23-1 = 8388607 bytes) - see that file's own comment on the fix for
+the full arithmetic. A software-side defensive change to `radioctl.c`
+(auto-split any `mm2s_play()` transfer above a conservative safe size,
+regardless of the IP's configured width) was proposed and is pending
+review/apply - see chat history around this fix for the exact patch.
+
+This was found and fixed *after* three other real, necessary fixes that
+turned out not to be the main story (all still correct and worth keeping):
+the `proc_sys_reset_1`-based `dsp_clk`/`fclk1_resetn` reset fix (§0 below),
+a `sample_sniffer.vhd` diagnostic-capture duplicate-sample bug (level- vs
+edge-sensitive `wr_en` racing the `dsp_clk`→`clk` tap synchronizer), and the
+`PCW_FCLK_CLK1_BUF`/`dont_touch`-on-`u` fixes described further down. None of
+those were wrong to fix, but none of them were *the* bug either - a useful
+reminder that "still failing after N real fixes" doesn't mean fix N+1 is
+wrong, it means keep looking.
+
+**Still open:** confirm the `--chunks` multi-chunk path (all 4 chunks, not
+just the whole-file path) now also captures cleanly with the DMA width fix
+in place; decide on and apply the `radioctl.c` defensive patch; strip the
+hardware-debug `mark_debug`/`dont_touch`/ILA `create_debug_core` block from
+`vivado/constraints/system_top_cdc.xdc` before any build meant to be a real
+release rather than a debug session.
+
 ### 0. State of the board and tree right now
 
 **RTL simulation: `tb_dsp.vhd` passes end to end.** The `quality 0.417` /
@@ -1491,37 +1547,76 @@ Along the way the PLL also moved twice in the chain (after the matched
 filter, then after Gardner) — real but secondary; see
 `docs/system_design.md` §2.1 for the full account and §4.4 for the preamble
 story. Current result: `tb_dsp.vhd` reports 4/4 frames CRC-clean, 4/4 sync
-detections, quality ratio 719/1000. **This has NOT yet been re-confirmed on
-real hardware** — the `quality 0.417` symptom this section describes was a
-hardware (`radioctl loopback`) observation, and the fixes above have only
-been verified in RTL simulation so far. Re-running the loopback demo on the
-board with a freshly-built bitstream is the natural next step.
+detections, quality ratio 719/1000.
 
-**Diagnostic sample sniffer status, as last known:** `sample_sniffer.vhd` +
-the `pkg.vhd`/`reg_rw_interface.vhd`/`dsp_top.vhd`/`system_top.vhd` changes
-supporting it had passed `tb_reg_rw_interface.vhd` in simulation (a
-one-cycle BRAM read-latency bug was found and fixed there) but **had not yet
-been confirmed on real hardware** as of this update. Tap wiring inside
+**Since then: `dsp_top` moved to its own clock domain (`dsp_clk`, FCLK1,
+1 MHz), decoupled from the AXI/DMA side (`clk`, FCLK0, 40 MHz) by two async
+CDC FIFOs (`axis_cdc_fifo.vhd`).** This closes a real gap the RX-chain fixes
+above didn't touch: before this, `data_valid` was wired straight to
+`mm2s_tvalid`, so the DSP chain's "sample rate" was really however fast DMA
+happened to deliver bytes, not the chosen `fs = 1 MHz` every loop-filter
+constant is actually designed against. Two bring-up issues on the way, both
+now fixed:
+
+1. `PCW_FPGA1_PERIPHERAL_FREQMHZ` alone requests FCLK1's rate but doesn't
+   bring the output out - `PCW_FCLK_CLK1_BUF` also has to be `TRUE`, or
+   `dsp_clk` never toggles and `dsp_top` never advances past its first
+   sample (looks like a hung simulation, not obviously a clocking bug).
+2. Two genuinely independent clocks needed this project's first
+   hand-authored timing constraint - `vivado/constraints/system_top_cdc.xdc`
+   declares `clk`/`dsp_clk` an asynchronous clock group. Without it,
+   Vivado's static timing analyzer applies a normal synchronous setup/hold
+   check across a boundary that by design has no fixed phase relationship,
+   and reports the sniffer's tap synchronizer and the PLL's own registers
+   failing timing - not a real violation, a missing constraint.
+
+**Verified: implementation now closes timing on both domains, and
+`test_dsp_top.vhd` (which drives `dsp_top` directly, bypassing this CDC
+work entirely) completes and passes again** - that one broke separately,
+for an unrelated reason worth remembering: its `sim_time`/drain-time wait
+were fixed absolute durations independent of `clk_period`, so changing the
+testbench clock period alone (to make simulated time read out as real 1 MHz
+sample timing) silently broke how many clock edges the simulation allowed
+itself before giving up. Both are now expressed in cycles (`N * clk_period`)
+instead. See `docs/system_design.md` §2.1/§2.2 for the full account.
+
+**Now confirmed on real hardware** — see §-1 above. The `quality 0.417`/
+0-frames symptom this section describes did reproduce on hardware initially,
+but turned out to be an `axi_dma_0` DMA-length-register-width bug, not a
+`dsp_clk`/CDC/reset problem - the CDC work in this section was still
+necessary and correct, it just wasn't sufficient on its own.
+
+**Diagnostic sample sniffer status: confirmed on hardware, one real bug
+found and fixed there too.** `sample_sniffer.vhd`'s write-enable was
+level-sensitive (`wr_en <= filling and tap_valid_sel`) rather than
+edge-detected, but by the time the `dsp_clk`/CDC split existed, `tap_valid_sel`
+was a `dsp_clk`-domain strobe brought into `clk` by a plain 2-flop
+synchronizer (`tap_sync_proc`, `system_top.vhd`) - correct for
+metastability, but it doesn't narrow the pulse, so the level-sensitive
+`wr_en` re-wrote the same sample into consecutive capture-buffer slots.
+Confirmed via a real capture (duplicate consecutive I/Q pairs at ~20% of
+positions) and fixed by edge-detecting instead (`tap_valid_sel_d1`). This
+was a diagnostic-capture-only bug - `sample_sniffer.vhd` doesn't sit in the
+real RX datapath - so it never explains a `radioctl loopback` result, only
+whether a `radiomon --capture` picture can be trusted. Tap wiring inside
 `dsp_top.vhd` changed twice since (see §0's chain-order note and
 `docs/system_design.md` §4.3) — the tap semantics (post-DDC/filter/Gardner/PLL)
 are unchanged, but the underlying signal each one is wired from moved.
 `ID_MAGIC` bump (`...0001` → `...0002`) and the rest of the table below are
-still accurate as descriptions of that work; only its "never simulated"
-status has changed.
+still accurate as descriptions of that work.
 
 | Thing | State | Consequence |
 |---|---|---|
-| Sniffer RTL | Passed `tb_reg_rw_interface.vhd` in simulation; hardware status unconfirmed as of this update | Re-verify on hardware alongside the RX-chain fixes above |
+| Sniffer RTL | Confirmed on hardware; one duplicate-sample bug found and fixed (see above) | None outstanding |
 | `sample_sniffer.vhd` | New file | Picked up automatically by `create_project.tcl`'s `glob $hdl_dir/*.vhd`, no script edit needed |
 | `radioctl`/`radiomon` | Rebuilt into `output-zybo/target/` (constants mirror, `ID_MAGIC` bump, capture readout) | Needs an image rebuild and the rootfs update dance below |
 | `clk_ignore_unused` | In both `boot.cmd` files | Confirm the `boot.scr` on the FAT partition was regenerated; otherwise it only applies when typed by hand at the U-Boot prompt |
 
-**Next action:** build a fresh bitstream with the RX-chain fixes above, load
-it onto the board, confirm `radioctl read build`/`STATUS.BUILD_DIRTY` and
-`radioctl dump`'s `id` line read as expected, then re-run `radioctl loopback`
-against the same stimulus `tb_dsp.vhd` now passes against and see whether
-hardware agrees with simulation. `radiomon --capture <tap>` remains the
-direct way to inspect any one stage if it doesn't.
+**Next action:** see §-1 above - the loopback/CDC verification this section
+was originally written to plan is done. What's left: confirm the `--chunks`
+multi-chunk path with the `axi_dma_0` length-width fix in place, decide on
+the `radioctl.c` defensive patch, and strip the hardware-debug ILA
+instrumentation once satisfied.
 
 Avoid another hand edit to the BD: the script is the source of truth and has now proven it can rebuild the design.
 
@@ -1643,6 +1738,7 @@ Watch the output trees: they are named `output/`, `output-zybo/` and `output-pyn
   - [x] Bit-truth self-checking testbench (compares every S2MM beat against transmitted payload)
   - [x] Lock-quality metric (`rx_quality.vhd`) + `sync_count`, readable from the PS
   - [x] **RX chain now recovers frames in RTL simulation** — `tb_dsp.vhd`: 4/4 frames CRC-clean, 4/4 sync detections, quality ratio 719/1000. Took three bugs to get there (broken PLL phase detector formula, a PLL loop-filter sign error, and a preamble pattern triggering Gardner self-noise) — see "Where things stand" §0 and `docs/system_design.md` §2.1/§4.4. **Not yet re-confirmed on hardware** — the `quality 0.417` symptom this line used to describe was a hardware observation; re-running `radioctl loopback` with a fresh bitstream is the next step, not yet done.
+  - [x] **`dsp_top` decoupled onto its own clock domain (`dsp_clk`, FCLK1, 1 MHz)** via two async CDC FIFOs (`axis_cdc_fifo.vhd`), closing the gap where the DSP chain's real sample rate was previously just "however fast DMA delivers bytes". Needed a bring-up fix (`PCW_FCLK_CLK1_BUF`, the buffer-enable FCLK1 needs beyond frequency/port-enable) and this project's first hand-authored timing constraint (`vivado/constraints/system_top_cdc.xdc`, declaring `clk`/`dsp_clk` an asynchronous clock group). **Verified in simulation and Vivado implementation (timing closes on both domains) — not yet on hardware.** See "Where things stand" §0 and `docs/system_design.md` §2.1/§2.2.
   - [ ] Farrow interpolator / polyphase timing recovery — deferred to a standalone project
   - [ ] Automatic loop tuner — metric built, coefficient registers deliberately not yet added; `test_bench/loop_model.py` now covers gain *design* in software, which may reduce how much of this is still needed
 - [x] **PL register window pinned to `0x43C0_0000`** with a build-time check — an unpinned `assign_bd_address` put it at `0x4000_0000` and hard-locked the CPU on every register access

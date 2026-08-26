@@ -126,6 +126,54 @@ collapsed that to a clean, textbook damped step response. See
 the source (the measured Kd is negated before any gain is derived from it),
 so a straight regenerate keeps the right sign automatically.
 
+**`dsp_top` runs on its own clock domain now, `dsp_clk` (FCLK1, 1 MHz),
+decoupled from the AXI/DMA side's `clk` (FCLK0, 40 MHz) by two async CDC
+FIFOs.** Before this, `data_valid` was wired straight to `mm2s_tvalid`: the
+DSP chain advanced one sample per AXI-Stream beat, so the "sample rate" was
+really however fast DMA happened to deliver bytes, not a chosen number, and
+`mm2s_tready` was hardwired `'1'` (no backpressure at all). `dsp_clk` at
+1 MHz matches every constant already designed against `fs = 1 MHz`
+elsewhere (RRC taps, `ddc_fs_4`'s fs/4 carrier placement, both
+`loop_model.py`-designed loop filters) - `dsp_top` now runs at a real,
+chosen sample rate instead of inheriting AXI/DMA throughput, and
+`mm2s_tready` genuinely reflects FIFO occupancy.
+
+- **New file**: `axis_cdc_fifo.vhd` - a generic `xpm_fifo_async` wrapper
+  (first-word-fall-through), one instance per direction (MM2S → `ADC_IN`,
+  `rx_t*` → S2MM). `reg_rw_interface` and `sample_sniffer` stay on `clk`;
+  the sniffer's tap inputs cross via a plain 2-flop strobe synchronizer
+  (`tap_sync_proc` in `system_top.vhd`) rather than another FIFO - they are
+  diagnostic-only signals from a much slower source domain sampled by a
+  much faster destination domain, so losing a synchronizer stage's worth of
+  precision on an occasional diagnostic sample doesn't matter the way it
+  would for the sample path itself.
+- **Bring-up gotcha**: `PCW_FPGA1_PERIPHERAL_FREQMHZ` alone sets FCLK1's
+  requested rate but does not bring the output out - `PCW_EN_CLK1_PORT` and
+  `PCW_FPGA_FCLK1_ENABLE` both default to enabled once a frequency is set,
+  but `PCW_FCLK_CLK1_BUF` does not; leaving it `FALSE` means `dsp_clk` never
+  toggles, and `dsp_top` never advances past its first sample - a simulation
+  that looks hung, not obviously a clocking bug. `create_project.tcl` now
+  sets `PCW_FCLK_CLK1_BUF {TRUE}` explicitly.
+- **First hand-authored timing constraint this project has needed**:
+  `vivado/constraints/system_top_cdc.xdc` declares `clk`/`dsp_clk` an
+  asynchronous clock group (`set_clock_groups -asynchronous`). Until
+  `dsp_clk` existed, Vivado's automatic clock derivation from the PS7 BD
+  cell was sufficient for a single-clock design; two genuinely independent
+  clocks need this declared explicitly, or the static timing analyzer
+  applies a normal synchronous setup/hold check across a boundary that by
+  design has no fixed phase relationship, and reports it failing - not a
+  real violation, a missing constraint. `xpm_fifo_async` handles the
+  *functional* metastability correctly on its own (`CDC_SYNC_STAGES`), but
+  per Xilinx's own guidance that does not exempt the design from also
+  declaring the clock group - same for the hand-written `tap_sync_proc`
+  synchronizer, which has no XPM macro to do it automatically. Checked in
+  as a real file (not generated only at project-creation time) so a project
+  maintained by hand between `create_project.tcl` regenerations can still
+  pull it in directly.
+- **Verified**: with the buffer-enable and clock-group fixes above,
+  implementation closes timing on both domains and `dsp_top` recovers
+  frames correctly running on its own dedicated `dsp_clk`.
+
 ### 2.2 Stage reference
 
 | Stage | File | In → Out | Status |
@@ -144,12 +192,34 @@ fabric clock, so no clock-domain conversion is needed anywhere — only the righ
 strobe. `G_VALID_SRC` selects where that strobe comes from (`VALID_DMA`,
 `VALID_ADC`, or `VALID_ALWAYS` for simulation).
 
-That is also why the fabric clock is a free parameter rather than a system
-requirement: FCLK0 is **40 MHz**, chosen to close timing on the matched
-filter's DSP cascade, and no part of the chain's behaviour depends on it. It is
-set in two places that must agree — `PCW_FPGA0_PERIPHERAL_FREQMHZ` in
-`create_project.tcl` (the timing constraint) and `assigned-clock-rates` in the
-devicetree (the actual rate).
+That sample-rate-agnostic property is also why FCLK0 (`clk`, the AXI/DMA
+side) is a free parameter rather than a system requirement: it is **40
+MHz**, chosen to close timing on the matched filter's DSP cascade, and no
+part of the chain's *functional* behaviour depends on it - dsp_top's own
+RTL has no notion of wall-clock time anywhere, only discrete
+`data_valid`-driven samples (see §2.1's clock-domain note, and the same
+point applies to `test_dsp_top.vhd`'s own testbench clock, which is
+similarly free to pick for simulation-time readability without changing
+what's being tested).
+
+**`dsp_clk` (FCLK1, `dsp_top`'s own domain, §2.1) is different: 1 MHz is not
+an arbitrary choice there.** It is not a timing requirement either - the
+loop filters would still be functionally correct at any rate the CDC FIFOs
+could keep up with - but it is what makes the *design-time* `Bn·Ts`
+assumption behind the PLL/Gardner gains (`loop_model.py`) and the
+stimulus's `freq_err_hz`/`ppm` (in real Hz, computed against `FS =
+1_000_000` in `waveform_generator.py`) both describe the same real-world
+signal. Changing it would not break the RTL, but it would silently change
+what frequency offset "250 Hz residual" and what clock error "20 ppm"
+actually represent relative to the sample rate, without anything failing
+loudly to say so.
+
+Both clocks are set in two places that must agree — `PCW_FPGA0_
+PERIPHERAL_FREQMHZ`/`PCW_FPGA1_PERIPHERAL_FREQMHZ` in `create_project.tcl`
+(the timing constraints) and `assigned-clock-rates` in the devicetree (the
+actual rates) - see §2.1's bring-up gotcha for FCLK1 specifically
+(`PCW_FCLK_CLK1_BUF`), which has no FCLK0 equivalent since FCLK0 already
+worked before `dsp_clk` was added.
 
 ### 2.3 Design decisions worth knowing
 
@@ -254,6 +324,21 @@ isolating "loop mechanism" from "data content" problems, not by inspection.
   Gardner TED self-noise pathology - see §4.4. `test_bench/loop_model.py`
   is the tool that found the last two; `test_bench/rx_model.py` still
   covers the framing/CRC path independently (§2.4).
+- **Resolved, was here as an open item: hardware now reproduces the sim
+  result** (`radioctl loopback`, whole file: 4/4 frames CRC-clean, quality
+  720/1000 vs. sim's 719/1000). The DSP chain was never actually the
+  problem on hardware - every hardware-only symptom (poor lock, 0/4 frames,
+  `S2MM_DMASR` stuck at `0x00000000`) traced to one root cause: `axi_dma_0`'s
+  `c_sg_length_width` left at its IP default of 14 bits (max 16383 bytes).
+  A whole-file transfer (6140 samples × 4 bytes = 24560 bytes) overflows
+  that silently rather than erroring - `24560 mod 16384 = 8176 bytes =
+  2044 samples`, confirmed directly via a hardware ILA capture showing
+  `dsp_valid` as a clean, gap-free burst of exactly 2044 samples then
+  nothing for the rest of the capture. Fixed via `CONFIG.c_sg_length_width
+  {23}` on `axi_dma_0` (`create_project.tcl`). See `docs/zybo_work.md`'s
+  "WHERE THINGS STAND" §-1 for the full account, including the
+  `sample_sniffer.vhd`/reset/`PCW_FCLK_CLK1_BUF` fixes found along the way
+  that were real but not this bug.
 - Gardner's timing resolution is still whole-sample-quantised (see the
   bullet below) - correctly converged, not correctly precise. `G_K = 12578`
   / `G_GAIN_FRAC = 16` are the loop_model.py-designed values, not untuned
@@ -338,6 +423,14 @@ flowchart LR
     DSP -->|"S_AXIS_S2MM"| DMAC
     REGS <--> DSP
 ```
+
+`DMAC -> DSP` and `DSP -> DMAC` each cross a clock domain now (`clk`/FCLK0 →
+`dsp_clk`/FCLK1 and back, via `axis_cdc_fifo.vhd`) - not shown as a separate
+box above since it doesn't change the interface topology, only what's
+between the endpoints. See §2.1's clock-domain note for the CDC FIFOs
+themselves and §2.2 for why `dsp_clk` is set to 1 MHz specifically.
+`REGS <-> DSP` (the sniffer's tap signals) stays on `clk` throughout - see
+§2.1's note on `tap_sync_proc`.
 
 | Interface | Path | Address | Size |
 |---|---|---|---|
@@ -811,7 +904,98 @@ around it identically: a plain `std::cout` header line, then the
 to touch the broken code path). Full account in the comment block at the top
 of `plot_lib.hpp` and `radiomon.cpp`.
 
-### 5.5 RX receive sequence
+### 5.5 Test cases: `radioctl loopback` + `radiomon`
+
+`radioctl loopback` and `radiomon` are independent programs — neither invokes
+the other, and nothing coordinates their timing (§5.3, §5.4). Which of the two
+`radiomon` modes to use, and when to start it relative to `loopback`, depends
+entirely on which question is being asked. This section is the practical
+playbook; §5.3/§5.4 are the reference for what each flag actually does.
+
+**A. Automated pass/fail — does the receiver actually decode correctly?**
+
+```bash
+radioctl loopback ddc_input.dat --chunks rx_chunks.txt --expect rx_expected_stream.dat --out captured.bin
+```
+
+The verdict is `loopback`'s own printed summary (frames passing CRC, beat
+mismatches, `all expected beats`) - this is the hardware equivalent of
+`tb_dsp.vhd`'s check, and is self-contained. `radiomon` isn't required for
+this case; it adds visibility, not correctness.
+
+**B. Watch lock quality live while a loopback plays**
+
+```bash
+# terminal 1 - start first, leave running
+radiomon
+# terminal 2 - whenever ready
+radioctl loopback ddc_input.dat --chunks rx_chunks.txt --expect rx_expected_stream.dat --out captured.bin
+```
+Other radiomon patterns
+```bash
+radiomon --capture ddc --view waveform --capture-timeout 10000     # raw, post-DDC
+radiomon --capture filtered --view waveform --capture-timeout 10000 # post matched filter, pre-loops
+radiomon --capture sym --view constellation --capture-timeout 10000 # post-Gardner
+radiomon --capture pll --view constellation --capture-timeout 10000 # post-PLL, final
+```
+
+Default mode tolerates being started first (§5.4) - it just re-polls the
+status registers every `--interval` ms regardless of whether anything is
+happening yet. A **good** run: the quality trace climbs toward 1.0 and
+`sync`/`frame` counters increment as `loopback` plays each chunk. A **bad**
+run: quality stays flat near a low value (`<0.7` is "poor lock" by the same
+threshold `tb_dsp.vhd` uses) and the counters never move at all - that
+distinguishes "converging slowly" from "not converging" without needing a
+capture.
+
+**C. Snapshot one stage's constellation/waveform during a run**
+
+```bash
+# terminal 1 - arm first, generous timeout to cover switching terminals
+radiomon --capture pll --view constellation --capture-timeout 10000
+# terminal 2 - start promptly, WITHIN that window
+radioctl loopback ddc_input.dat --chunks rx_chunks.txt \
+    --expect rx_expected_stream.dat --out captured.bin
+```
+
+Unlike (B), `--capture` is one-shot and must overlap `loopback` in time -
+the sniffer only advances while something is actively driving MM2S (§5.4),
+so arming it before `loopback` starts (not after) is required, not just
+convenient. Pick the tap for the question being asked (§4.3's table gives
+the full mapping): `ddc` - is the carrier being removed at all; `filtered` -
+is the pulse shape/ISI what it should be, before either recovery loop runs;
+`sym` - is timing recovery converging, independent of carrier lock; `pll` -
+the final, carrier-corrected signal reaching the slicer. Reading the
+picture: four tight corner clusters is locked QPSK; a spinning or
+noise-filled disc is not (§5.4's constellation note). `--view waveform`
+shows the same capture as I/Q vs. sample index instead, useful for
+transient/settling behaviour a single scatter plot can't show - compare
+against `test_bench/loop_model.py -plot`'s simulated traces for the same
+signal.
+
+**D. Just monitoring signal behaviour, no formal pass/fail check**
+
+For DSP tuning work rather than regression testing - characterizing what a
+loop actually does, not verifying it against `rx_expected_stream.dat`.
+`loopback`'s `--expect`/verdict machinery isn't needed here; the point is
+the `radiomon` view, not the transfer's own summary:
+
+- Leave (B)'s live-trend view running continuously while iterating on
+  something else (a new stimulus, a coefficient change, a bitstream
+  rebuild) - it's a free-running observation, not a per-run check.
+- Repeat (C) at the same tap across iterations to compare qualitatively -
+  arm, run `loopback`, look at the picture, change one thing, repeat. This
+  is the hardware-side counterpart to `loop_model.py -plot`'s simulated
+  traces, and worth doing when hardware behaviour is suspected to differ
+  from what the model predicts (real ADC noise, layout-dependent timing
+  effects, anything the model doesn't capture).
+- `loopback` is the stand-in signal source for all of the above because
+  there is no live RF path yet (§2.5, §3) - once one exists, the same two
+  `radiomon` modes apply directly to genuinely live traffic without change;
+  neither cares where `data_valid` pulses came from, only that they're
+  happening.
+
+### 5.6 RX receive sequence
 
 ```mermaid
 sequenceDiagram
@@ -852,7 +1036,7 @@ transfer**, so the destination address and `RS` must both be set first.
 PL terminates the transfer early with `TLAST` at the end of a frame rather than
 filling the requested capacity.
 
-### 5.6 AXI DMA registers used
+### 5.7 AXI DMA registers used
 
 Simple mode only — SG is disabled in the IP, so descriptor registers do not
 exist. Byte offsets from `0x8040_0000`.
@@ -864,10 +1048,21 @@ exist. Byte offsets from `0x8040_0000`.
 | `0x48` | `S2MM_DA` | Destination physical address |
 | `0x58` | `S2MM_LENGTH` | Write starts transfer; read returns bytes moved |
 
-Simple mode caps one transfer at 2²⁶−1 bytes — far more than a frame, or than
-any stimulus buffer pushed the other way.
+Simple mode's transfer-length register width (`c_sg_length_width`) is what
+actually caps one transfer, and it is **not** automatically "far more than
+any stimulus buffer" - the IP's own default is 14 bits (max 16383 bytes),
+and this project now explicitly widens it to 23 bits (max 2²³−1 =
+8388607 bytes) via `CONFIG.c_sg_length_width {23}` on `axi_dma_0` in
+`create_project.tcl`. Before that fix, a whole-file loopback transfer
+(6140 samples × 4 bytes = 24560 bytes) silently wrapped at the 14-bit
+default - `24560 mod 16384 = 8176 bytes` moved, no error raised anywhere -
+see §2.5 and `docs/zybo_work.md`'s "WHERE THINGS STAND" §-1 for how this
+was found and confirmed. Writing a length that exceeds whatever
+`c_sg_length_width` is currently configured to is a silent truncation, not
+a caught error, on this IP - worth remembering if the width is ever changed
+again.
 
-### 5.7 Software gaps
+### 5.8 Software gaps
 
 - **Polling, not interrupts.** `radioctl` polls `DMASR.IOC_Irq` with a 1 ms
   sleep. The devicetree already routes the S2MM interrupt to the DMA's UIO node,
@@ -878,8 +1073,8 @@ any stimulus buffer pushed the other way.
 - No TX-side software, because there is no TX chain. `loopback` fills the gap
   for bring-up by replaying a recorded file, which exercises the receiver
   without needing one.
-- **`loopback` has not been run on hardware yet** — the parsing and comparison
-  logic is host-tested, the DMA sequencing is not.
+- ~~`loopback` has not been run on hardware yet~~ — resolved; see §5.5 for the
+  test cases now run routinely on hardware alongside `radiomon`.
 - `radioctl` is a bring-up tool, not a library. A daemon holding the mappings
   open and exposing a socket would suit continuous operation better than a
   process that re-arms the DMA per invocation.

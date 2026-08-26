@@ -1,7 +1,7 @@
 # One playback chunk per frame: <first sample> <count>
 # Indices into ddc_input.dat. Boundaries sit mid-gap so each
 # chunk holds exactly one frame - see save_chunks() for why.
-0 1479
-1478 1537
-3014 1537
-4550 1537
+0 1478
+1478 1536
+3014 1536
+4550 1536

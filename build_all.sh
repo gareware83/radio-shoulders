@@ -14,3 +14,9 @@ make -C ../buildroot/ O="$(pwd)/output-pynq" BR2_EXTERNAL="$(pwd)"
 echo "=== Done ==="
 echo "Zybo images: $(pwd)/output-zybo/images/"
 echo "PYNQ images: $(pwd)/output-pynq/images/"
+## Zybo
+#make -C ../buildroot/ O="$(pwd)/output-zybo" BR2_EXTERNAL="$(pwd)" radioctl-rebuild
+#make -C ../buildroot/ O="$(pwd)/output-zybo" BR2_EXTERNAL="$(pwd)" radiomon-rebuild
+
+
+

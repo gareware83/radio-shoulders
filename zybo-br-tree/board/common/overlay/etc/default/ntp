@@ -11,4 +11,4 @@
 # NOTE this is a DHCP address on the dev host's wifi - if time sync stops
 # working, check it is still correct before assuming anything is broken. A
 # static lease on the router avoids the problem.
-NTP_SERVER=10.0.0.191
+NTP_SERVER=10.0.0.192

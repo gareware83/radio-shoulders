@@ -17,7 +17,19 @@ entity pll_2nd_order is
         Q_in    : in  signed(15 downto 0);
         -- output corrected samples
         I_out   : out signed(15 downto 0);
-        Q_out   : out signed(15 downto 0)
+        Q_out   : out signed(15 downto 0);
+
+        -- Hardware/sim debug trace only (docs/zybo_work.md's hardware-debug
+        -- section) - mirrors what the hardware ILA capture already taps via
+        -- mark_debug, so test_dsp_top.vhd's trace dump can get the same
+        -- signals through a real port instead of a VHDL-2008 external name
+        -- (xsim 2022.2 crashes on those reaching into an if-generate region -
+        -- see the testbench's own history for why this exists as a port
+        -- rather than an external name).
+        dbg_u         : out signed(31 downto 0);
+        dbg_phase_err : out signed(31 downto 0);
+        dbg_nco_sin   : out signed(15 downto 0);
+        dbg_nco_cos   : out signed(15 downto 0)
     );
 end entity;
 
@@ -125,6 +137,27 @@ signal phase_err       : signed(31 downto 0) := (others => '0');
 signal e_prev         : signed(31 downto 0) := (others => '0');
 signal u              : signed(31 downto 0) := (others => '0');
 
+-- Hardware debug (ILA) round 1 - see system_top.vhd's mark_debug block.
+-- phase_err/u are the convergence signals: phase_err should settle to a
+-- small, roughly-constant residual once locked, not oscillate with large
+-- swings or rail at extremes - u is the loop filter's running estimate,
+-- should track and hold steady once phase_err has settled.
+--
+-- u also gets dont_touch, not just mark_debug: it's a 32-bit accumulator
+-- that (per this file's own comments) rarely gets near its saturation
+-- rails for real input - synthesis's static range analysis can legitimately
+-- prove individual high-order bits never change for the reachable values it
+-- sees and constant-propagate just those bits away, even though mark_debug
+-- keeps the signal as a whole from being deleted. dont_touch blocks that
+-- bit-level optimization too, which mark_debug alone does not.
+attribute mark_debug : string;
+attribute mark_debug of phase_err : signal is "true";
+attribute mark_debug of u         : signal is "true";
+attribute mark_debug of nco_cos   : signal is "true";
+attribute mark_debug of nco_sin   : signal is "true";
+
+attribute dont_touch : string;
+attribute dont_touch of u : signal is "true";
 
 begin
 
@@ -329,6 +362,12 @@ end process;
     ------------------------------------------------------------------
  I_out <= (I_rot);
  Q_out <= (Q_rot);
+
+    -- debug trace passthrough, see the port declaration's comment
+    dbg_u         <= u;
+    dbg_phase_err <= phase_err;
+    dbg_nco_sin   <= nco_sin;
+    dbg_nco_cos   <= nco_cos;
 
 end architecture;
 --reminder for bit growth rules:

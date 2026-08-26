@@ -515,8 +515,19 @@ class RRCWaveformGenerator:
             first_sym = m["start_symbol"] - (half_gap if i else self.span)
             last_sym = m["start_symbol"] + m["n_symbols"] + half_gap
 
+            # last_sym of frame i and first_sym of frame i+1 are the SAME
+            # value (both equal start_symbol_i + n_symbols_i + half_gap) -
+            # each chunk's boundary is the shared gap midpoint, by design
+            # (see the docstring). end MUST use the same rounding as start
+            # (floor, not ceil) or that shared boundary sample lands in
+            # BOTH chunks: end_i = ceil(x), start_{i+1} = floor(x) - when x
+            # isn't an exact integer, ceil(x) = floor(x)+1, so chunk i's
+            # half-open range [start_i, end_i) still includes floor(x),
+            # which is also chunk i+1's own start. Confirmed on hardware:
+            # radioctl printed "chunk 1: samples 0..1478" / "chunk 2:
+            # samples 1478..3014" - sample 1478 played twice.
             start = int(np.floor(self.symbol_to_sample(first_sym, timing_offset, ppm)))
-            end = int(np.ceil(self.symbol_to_sample(last_sym, timing_offset, ppm)))
+            end = int(np.floor(self.symbol_to_sample(last_sym, timing_offset, ppm)))
 
             start = max(0, start)
             end = min(n_samples, end)

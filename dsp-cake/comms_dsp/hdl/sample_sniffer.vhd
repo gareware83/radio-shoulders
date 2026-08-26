@@ -93,6 +93,7 @@ architecture rtl of sample_sniffer is
     signal tap_i_sel     : signed(15 downto 0);
     signal tap_q_sel     : signed(15 downto 0);
     signal tap_valid_sel : std_logic;
+    signal tap_valid_sel_d1 : std_logic := '0';   -- for edge detection, see wr_en below
 
     signal wr_en   : std_logic;
     signal wr_data : std_logic_vector(31 downto 0);
@@ -107,8 +108,15 @@ begin
 
     ---------------------------------------------------------------------
     -- Tap mux. Every stage runs on the same clk, gated only by its own
-    -- valid strobe - a plain combinational select, no clock-domain
-    -- crossing anywhere in this design.
+    -- valid strobe - a plain combinational select. NOTE this module's own
+    -- clock domain is uniform, but that no longer means its *_valid inputs
+    -- are single-cycle-clean: since the dsp_clk/CDC split (system_top.vhd's
+    -- tap_sync_proc), each is a dsp_clk-domain strobe brought into [clk] by
+    -- a plain 2-flop synchronizer - correct for metastability, but it does
+    -- not narrow the pulse. Because dsp_clk is much slower than clk, the
+    -- synchronized strobe reads '1' for more than one clk cycle, so wr_en
+    -- below must edge-detect it rather than follow it as a level - see the
+    -- history of this file for why that used to be safe to skip.
     ---------------------------------------------------------------------
     tap_mux : process (all)
     begin
@@ -126,8 +134,13 @@ begin
 
     -- I in the low half, Q in the high half - see C_CAPTURE_I_RANGE /
     -- C_CAPTURE_Q_RANGE in pkg.vhd.
+    -- Edge-detected (rising edge of tap_valid_sel only) rather than a level
+    -- check - tap_valid_sel_d1 is registered unconditionally in fill_proc
+    -- below, one cycle behind. A level check here would re-write the same
+    -- sample into consecutive capture slots for as many clk cycles as the
+    -- synchronized strobe happens to read '1'.
     wr_data <= std_logic_vector(tap_q_sel) & std_logic_vector(tap_i_sel);
-    wr_en   <= filling and tap_valid_sel;
+    wr_en   <= filling and tap_valid_sel and not tap_valid_sel_d1;
 
     fill_proc : process (clk)
     begin
@@ -136,7 +149,12 @@ begin
                 wr_ptr  <= (others => '0');
                 filling <= '0';
                 done_i  <= '0';
+                tap_valid_sel_d1 <= '0';
             else
+                -- Unconditional (not gated by filling/arm) so edge detection
+                -- stays correct across arm boundaries too.
+                tap_valid_sel_d1 <= tap_valid_sel;
+
                 if arm = '1' then
                     wr_ptr  <= (others => '0');
                     filling <= '1';

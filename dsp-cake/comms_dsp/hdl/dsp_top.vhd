@@ -63,7 +63,26 @@ entity dsp_top is
 
         tap_sym_i        : out signed(15 downto 0);    -- post timing recovery
         tap_sym_q        : out signed(15 downto 0);    -- (= gard_i/q), BEFORE
-        tap_sym_valid    : out std_logic               -- the PLL now
+        tap_sym_valid    : out std_logic;              -- the PLL now
+
+        -- Hardware/sim debug trace only (docs/zybo_work.md's hardware-debug
+        -- section) - same signals the hardware ILA capture already taps via
+        -- mark_debug, exposed here as real ports so test_dsp_top.vhd's
+        -- trace dump can reach them without a VHDL-2008 external name
+        -- (xsim 2022.2 crashes on those reaching into an if-generate region).
+        dbg_mu           : out unsigned(31 downto 0);
+        dbg_incr         : out unsigned(31 downto 0);
+        dbg_timing_err   : out signed(31 downto 0);
+        dbg_u            : out signed(31 downto 0);
+        dbg_phase_err    : out signed(31 downto 0);
+        dbg_nco_sin      : out signed(15 downto 0);
+        dbg_nco_cos      : out signed(15 downto 0);
+        dbg_bits_valid   : out std_logic;
+        dbg_sliced_bits  : out std_logic_vector(1 downto 0);
+        dbg_fb_start     : out std_logic;
+        dbg_fb_done      : out std_logic;
+        dbg_fb_ok        : out std_logic;
+        dbg_fb_len       : out unsigned(7 downto 0)
     );
 end dsp_top;
 
@@ -152,6 +171,25 @@ signal fb_len         : unsigned(7 downto 0);
 signal fb_type        : std_logic_vector(3 downto 0);
 signal fb_seq         : std_logic_vector(3 downto 0);
 
+-- Hardware debug (ILA) round 1 - see system_top.vhd's own mark_debug block
+-- for the CDC/reset half of this; these are the chain-internal signals that
+-- answer "is the loop actually converging on real hardware, and does a
+-- frame ever internally complete" - fb_ok/fb_done bracket each attempted
+-- frame, timing_err/gard_valid and pll_valid bracket the two recovery loops.
+attribute mark_debug : string;
+attribute mark_debug of ddc_valid      : signal is "true";
+attribute mark_debug of filtered_valid : signal is "true";
+attribute mark_debug of gard_valid     : signal is "true";
+attribute mark_debug of timing_err     : signal is "true";
+attribute mark_debug of pll_valid      : signal is "true";
+attribute mark_debug of sym_valid      : signal is "true";
+attribute mark_debug of bits_valid     : signal is "true";
+attribute mark_debug of sliced_bits    : signal is "true";
+attribute mark_debug of fb_start       : signal is "true";
+attribute mark_debug of fb_done        : signal is "true";
+attribute mark_debug of fb_ok          : signal is "true";
+attribute mark_debug of fb_len         : signal is "true";
+
 begin
 
 ------------------------------------------------------------------
@@ -209,6 +247,8 @@ timing_gen: if G_TIMING = True generate
             ,i_out      => gard_i
             ,q_out      => gard_q
             ,timing_err => timing_err
+            ,dbg_mu     => dbg_mu
+            ,dbg_incr   => dbg_incr
         );
 
 else generate
@@ -217,6 +257,8 @@ else generate
     gard_q      <= filtered_q;
     gard_valid  <= filtered_valid;
     timing_err  <= (others => '0');
+    dbg_mu      <= (others => '0');
+    dbg_incr    <= (others => '0');
 
 end generate;
 
@@ -231,13 +273,17 @@ pll_gen: if G_PLL = True generate
 
     inst_pll: entity work.pll_2nd_order
         port map (
-             clk        => SYS_CLK
-            ,rst        => ARST
-            ,data_valid => gard_valid
-            ,I_in       => gard_i
-            ,Q_in       => gard_q
-            ,I_out      => pll_i
-            ,Q_out      => pll_q
+             clk           => SYS_CLK
+            ,rst           => ARST
+            ,data_valid    => gard_valid
+            ,I_in          => gard_i
+            ,Q_in          => gard_q
+            ,I_out         => pll_i
+            ,Q_out         => pll_q
+            ,dbg_u         => dbg_u
+            ,dbg_phase_err => dbg_phase_err
+            ,dbg_nco_sin   => dbg_nco_sin
+            ,dbg_nco_cos   => dbg_nco_cos
         );
 
     -- pll_2nd_order has no valid output: its phase detector registers
@@ -263,6 +309,10 @@ else generate  -- PLL bypassed: straight from Gardner
     sym_i     <= gard_i;
     sym_q     <= gard_q;
     sym_valid <= gard_valid;
+    dbg_u         <= (others => '0');
+    dbg_phase_err <= (others => '0');
+    dbg_nco_sin   <= (others => '0');
+    dbg_nco_cos   <= (others => '0');
 
 end generate;
 
@@ -379,5 +429,17 @@ tap_sym_valid <= gard_valid;
 tap_pll_i     <= sym_i;
 tap_pll_q     <= sym_q;
 tap_pll_valid <= sym_valid;
+
+-- debug trace passthrough, see the port declarations' comment. mu/incr and
+-- u/phase_err/nco_sin/nco_cos are wired directly in the timing_gen/pll_gen
+-- generate blocks above (both branches, including bypass) since they come
+-- from inside those conditional regions.
+dbg_timing_err  <= timing_err;
+dbg_bits_valid  <= bits_valid;
+dbg_sliced_bits <= sliced_bits;
+dbg_fb_start    <= fb_start;
+dbg_fb_done     <= fb_done;
+dbg_fb_ok       <= fb_ok;
+dbg_fb_len      <= fb_len;
 
 end Behavioral;

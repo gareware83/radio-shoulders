@@ -298,8 +298,19 @@ static long s2mm_wait(int timeout_ms)
 			return (long)dma_rd(S2MM_LENGTH);
 		}
 
-		if (now_ms() > deadline)
+		if (now_ms() > deadline) {
+			/* DMASR at the moment of giving up - the one piece of
+			 * evidence that tells "DMA never saw a stream at all"
+			 * (IDLE, no SGIncld/DMAIntErr) apart from "something
+			 * else is wrong". Silently discarding sr here was the
+			 * gap that made every previous timeout look identical
+			 * regardless of cause. */
+			fprintf(stderr, "    S2MM_DMASR=0x%08x at timeout"
+					"%s%s\n", sr,
+				(sr & DMASR_HALTED) ? " HALTED" : "",
+				(sr & DMASR_IDLE)   ? " IDLE"   : "");
 			return -2;   /* timeout, not an error */
+		}
 
 		usleep(1000);
 	}

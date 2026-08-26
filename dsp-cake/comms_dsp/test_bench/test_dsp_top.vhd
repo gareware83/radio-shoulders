@@ -98,7 +98,111 @@ architecture sim of test_dsp_top is
     -- stimulus: "<data hex8> <tkeep hex1> <tlast 0|1>", one line per beat.
     file exp_file  : text open read_mode is "rx_expected_stream.dat";
 
+    ----------------------------------------------------------------------
+    -- Debug trace dump: mirrors the columns of a hardware ILA capture
+    -- (see board/common/iladata.csv, and docs/zybo_work.md's hardware-debug
+    -- section) so hardware and simulation traces of the same stimulus can
+    -- be diffed directly, sample for sample, rather than compared by eye.
+    --
+    -- Driven from dsp_top's own dbg_*/tap_* ports (real ports, wired
+    -- through the entity like everything else) rather than VHDL-2008
+    -- external names - xsim 2022.2 crashes (SIGSEGV during elaboration)
+    -- reaching an external name into a signal nested inside an if-generate
+    -- region, which mu/incr/u/phase_err/nco_sin/nco_cos all are. See
+    -- dsp_top.vhd/pll_2nd_order.vhd/timing_recovery_gardner.vhd's own
+    -- dbg_* port comments for the other half of this.
+    ----------------------------------------------------------------------
+    signal probe_mu          : unsigned(31 downto 0);
+    signal probe_incr        : unsigned(31 downto 0);
+    signal probe_timing_err  : signed(31 downto 0);
+    signal probe_u           : signed(31 downto 0);
+    signal probe_phase_err   : signed(31 downto 0);
+    signal probe_nco_sin     : signed(15 downto 0);
+    signal probe_nco_cos     : signed(15 downto 0);
+    signal probe_bits_valid  : std_logic;
+    signal probe_sliced_bits : std_logic_vector(1 downto 0);
+    signal probe_fb_start    : std_logic;
+    signal probe_fb_done     : std_logic;
+    signal probe_fb_ok       : std_logic;
+    signal probe_fb_len      : unsigned(7 downto 0);
+
+    -- Existing tap_* ports on dsp_top (already there for sample_sniffer's
+    -- benefit in system_top.vhd, just never connected in this testbench
+    -- before) give the *_valid columns for free - tap_sym_valid tracks
+    -- gard_valid, tap_pll_valid tracks the final sym_valid/pll_valid (see
+    -- dsp_top.vhd's own tap_* port comments for why the sym/pll naming
+    -- crosses over like that). i/q halves left unconnected below - not
+    -- needed for this trace.
+    signal tap_ddc_valid      : std_logic;
+    signal tap_filtered_valid : std_logic;
+    signal tap_sym_valid      : std_logic;   -- = gard_valid
+    signal tap_pll_valid      : std_logic;   -- = sym_valid (= pll_valid when G_PLL)
+
 begin
+
+    ----------------------------------------------------------------------
+    -- Trace dump process. Same column set as the ILA export (order doesn't
+    -- need to match - compare by column name, not position), hex throughout
+    -- to match iladata.csv's own radix exactly - to_hstring on a signed/
+    -- unsigned gives the same raw two's-complement bit pattern the ILA
+    -- shows, so e.g. a negative timing_err reads as the same "ffffc296"
+    -- style value on both sides with no conversion needed to compare them.
+    -- Also sidesteps to_integer's 32-bit range limit, which mu/incr (both
+    -- unsigned, spanning the FULL 0..2**32-1 range as free-running
+    -- accumulators) will exceed routinely - to_integer would raise a
+    -- runtime error the first time mu crossed 2**31.
+    ----------------------------------------------------------------------
+    trace_dump_process : process
+        file trace_file : text open write_mode is "sim_trace.csv";
+        variable l : line;
+        variable sample_idx : natural := 0;
+
+        procedure wr_bit(b : std_logic) is
+        begin
+            if b = '1' then
+                write(l, string'("1"));
+            else
+                write(l, string'("0"));
+            end if;
+        end procedure;
+    begin
+        write(l, string'("sample,mu,incr,timing_err,u,phase_err,nco_sin,nco_cos,")
+                & string'("ddc_valid,filtered_valid,gard_valid,pll_valid,sym_valid,")
+                & string'("bits_valid,sliced_bits,fb_start,fb_done,fb_ok,fb_len,")
+                & string'("data_valid,rst"));
+        writeline(trace_file, l);
+
+        wait until rst = '0';
+        while now < sim_time loop
+            wait until rising_edge(clk);
+
+            write(l, sample_idx);                    write(l, string'(","));
+            write(l, to_hstring(probe_mu));           write(l, string'(","));
+            write(l, to_hstring(probe_incr));         write(l, string'(","));
+            write(l, to_hstring(probe_timing_err));   write(l, string'(","));
+            write(l, to_hstring(probe_u));            write(l, string'(","));
+            write(l, to_hstring(probe_phase_err));    write(l, string'(","));
+            write(l, to_hstring(probe_nco_sin));      write(l, string'(","));
+            write(l, to_hstring(probe_nco_cos));      write(l, string'(","));
+            wr_bit(tap_ddc_valid);                    write(l, string'(","));
+            wr_bit(tap_filtered_valid);                write(l, string'(","));
+            wr_bit(tap_sym_valid);                    write(l, string'(","));   -- = gard_valid
+            wr_bit(tap_pll_valid);                    write(l, string'(","));   -- = sym_valid/pll_valid
+            wr_bit(tap_pll_valid);                    write(l, string'(","));   -- sym_valid column, same signal
+            wr_bit(probe_bits_valid);                 write(l, string'(","));
+            write(l, to_hstring(probe_sliced_bits));  write(l, string'(","));
+            wr_bit(probe_fb_start);                   write(l, string'(","));
+            wr_bit(probe_fb_done);                    write(l, string'(","));
+            wr_bit(probe_fb_ok);                       write(l, string'(","));
+            write(l, to_hstring(probe_fb_len));       write(l, string'(","));
+            wr_bit(valid_in);                         write(l, string'(","));
+            wr_bit(rst);
+            writeline(trace_file, l);
+
+            sample_idx := sample_idx + 1;
+        end loop;
+        wait;
+    end process;
 
     --------------------------------------------------------------------------
     -- Clock
@@ -372,6 +476,27 @@ begin
             ,qual_min    => qual_min
             ,qual_max    => qual_max
             ,qual_syms   => qual_syms
+
+            -- tap_* i/q halves unconnected - only the *_valid strobes are
+            -- needed for the trace dump above
+            ,tap_ddc_valid      => tap_ddc_valid
+            ,tap_filtered_valid => tap_filtered_valid
+            ,tap_sym_valid      => tap_sym_valid
+            ,tap_pll_valid      => tap_pll_valid
+
+            ,dbg_mu           => probe_mu
+            ,dbg_incr         => probe_incr
+            ,dbg_timing_err   => probe_timing_err
+            ,dbg_u            => probe_u
+            ,dbg_phase_err    => probe_phase_err
+            ,dbg_nco_sin      => probe_nco_sin
+            ,dbg_nco_cos      => probe_nco_cos
+            ,dbg_bits_valid   => probe_bits_valid
+            ,dbg_sliced_bits  => probe_sliced_bits
+            ,dbg_fb_start     => probe_fb_start
+            ,dbg_fb_done      => probe_fb_done
+            ,dbg_fb_ok        => probe_fb_ok
+            ,dbg_fb_len       => probe_fb_len
         );
 
 end sim;

@@ -73,7 +73,17 @@ entity timing_recovery_gardner is
         q_out      : out signed(15 downto 0);
 
         -- for STATUS / debug
-        timing_err : out signed(31 downto 0)
+        timing_err : out signed(31 downto 0);
+
+        -- Hardware/sim debug trace only (docs/zybo_work.md's hardware-debug
+        -- section) - mirrors what the hardware ILA capture already taps via
+        -- mark_debug, so test_dsp_top.vhd's trace dump can get the same
+        -- signals through a real port instead of a VHDL-2008 external name
+        -- (xsim 2022.2 crashes on those reaching into an if-generate region -
+        -- see the testbench's own history for why this exists as a port
+        -- rather than an external name).
+        dbg_mu     : out unsigned(31 downto 0);
+        dbg_incr   : out unsigned(31 downto 0)
     );
 end timing_recovery_gardner;
 
@@ -129,11 +139,23 @@ architecture rtl of timing_recovery_gardner is
         end if;
     end function;
 
+    -- Hardware debug (ILA) round 1 - see system_top.vhd's mark_debug block.
+    -- mu should sawtooth 0 -> max -> wrap once per recovered symbol; incr
+    -- should settle near C_NOMINAL_INCR after an initial transient, not
+    -- drift continuously or rail at +/-C_ADJ_LIMIT.
+    attribute mark_debug : string;
+    attribute mark_debug of mu   : signal is "true";
+    attribute mark_debug of incr : signal is "true";
+
 begin
 
     -- err is 34-bit; saturate rather than resize, which would silently drop the
     -- top two bits and make a large error read back as a small one.
     timing_err <= sat32(err);
+
+    -- debug trace passthrough, see the port declaration's comment
+    dbg_mu   <= mu;
+    dbg_incr <= incr;
 
     process (clk)
         variable mu_next  : unsigned(32 downto 0);
