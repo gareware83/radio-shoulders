@@ -1,14 +1,15 @@
 # PLL Demo — A Discrete-Time, Complex-Valued Carrier-Recovery Loop
 
-A small, self-contained example pulled from a larger software-defined-radio
-project: a 2nd-order carrier-recovery PLL, written in synthesizable VHDL,
+A small, self-contained 2nd-order carrier-recovery PLL example pulled from a larger practice (for fun) software-defined-radio
+project, written in synthesizable VHDL,
 verified against a simple sine-wave stimulus with a self-checking testbench.
 
-This file explains what the design is, how the test proves it works, and
-one genuinely interesting thing the test run uncovered about *why* this
-particular kind of PLL behaves the way it does against a plain tone. It's
-written to stand on its own — no need to have read the rest of the parent
+This file explains what the design is and how the test proves it works. It's
+written to stand on its own without conext from the rest of the parent
 project.
+
+The parent project is on the following branch for anyone intersted in reviewing the state of the larger design. 
+[Radio-shoulders](https://github.com/gareware83/radio-shoulders)
 
 ## What this is
 
