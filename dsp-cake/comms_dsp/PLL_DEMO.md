@@ -1,7 +1,11 @@
 # PLL Demo — A Discrete-Time, Complex-Valued Carrier-Recovery Loop
 ## Results
 
-[tb pll sim](./pll_demo_sim.png)
+![tb pll sim](./pll_demo_sim.png)
+
+![Python simdata plot](./results/pll_demo_sim_view.png)
+
+You can run python3 sim_out_view.py ../results/pll_trace.csv --show to generate the Python simdata plot.
 
 ## Intro
 A small, self-contained 2nd-order carrier-recovery PLL example pulled from a larger practice (for fun) software-defined-radio
