@@ -1,5 +1,9 @@
 # PLL Demo — A Discrete-Time, Complex-Valued Carrier-Recovery Loop
+## Results
 
+[tb pll sim](./pll_demo_sim.png)
+
+## Intro
 A small, self-contained 2nd-order carrier-recovery PLL example pulled from a larger practice (for fun) software-defined-radio
 project, written in synthesizable VHDL,
 verified against a simple sine-wave stimulus with a self-checking testbench.
@@ -11,6 +15,8 @@ project.
 The parent project is on the following branch for anyone intersted in reviewing the state of the larger design. 
 [Radio-shoulders](https://github.com/gareware83/radio-shoulders)
 
+The development is accelerated using Claude AI code, steered by my professional experience in FPGA, DSP and SDR design. 
+ 
 ## What this is
 
 `pll_2nd_order.vhd` is a carrier-recovery loop: given a complex baseband
@@ -86,10 +92,6 @@ A full per-sample trace (`pll_trace.csv`) is also written for every run —
 every sample's input, output, phase error, and loop-filter state — so a
 claimed pass/fail can always be checked against the actual time-domain
 behavior, not just trusted from a summary number.
-
-## Results
-
-[tb pll sim](./pll_demo_sim.png)
 
 ## Files
 
