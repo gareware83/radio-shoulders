@@ -328,6 +328,17 @@ void usage(const char *p)
                  "  --view <constellation|waveform>   (default constellation)\n"
                  "  --out <file>      also write \"I Q\" per line to a file\n"
                  "  --capture-timeout <ms>   (default 5000)\n"
+                 "  --capture-continuous     keep re-arming/reading after each\n"
+                 "                    fill instead of stopping at one (the sniffer's\n"
+                 "                    buffer is a fixed CAPTURE_DEPTH snapshot, often\n"
+                 "                    much shorter than a whole transfer - this\n"
+                 "                    stitches consecutive fills into one capture).\n"
+                 "                    Stops on Ctrl-C, on --capture-frames being\n"
+                 "                    reached, or naturally once a fill times out\n"
+                 "                    (nothing left driving MM2S).\n"
+                 "  --capture-frames <n>     with --capture-continuous, stop once\n"
+                 "                    FRAME_COUNT has advanced by this many frames\n"
+                 "                    since the capture sequence started\n"
                  "\n"
                  "Reads the register window only; never touches the DMA control\n"
                  "window or the reserved sample buffer, in either mode.\n",
@@ -343,6 +354,8 @@ int main(int argc, char **argv)
     const char *capture_out = nullptr;
     const char *capture_view = "constellation";
     int capture_timeout_ms = 5000;
+    bool capture_continuous = false;
+    int capture_frames_target = -1;   // -1 = no target, run until Ctrl-C/end
 
     for (int i = 1; i < argc; i++) {
         bool has_val = i + 1 < argc;
@@ -363,6 +376,10 @@ int main(int argc, char **argv)
             capture_out = argv[++i];
         else if (!std::strcmp(argv[i], "--capture-timeout") && has_val)
             capture_timeout_ms = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--capture-continuous"))
+            capture_continuous = true;
+        else if (!std::strcmp(argv[i], "--capture-frames") && has_val)
+            capture_frames_target = std::atoi(argv[++i]);
         else {
             usage(argv[0]);
             return 1;
@@ -372,6 +389,13 @@ int main(int argc, char **argv)
     if (interval_ms < 10 || width < 10 || height < 2 || window < 2 ||
         capture_timeout_ms < 10) {
         std::fprintf(stderr, "implausible option value\n");
+        return 1;
+    }
+
+    if (capture_frames_target != -1 &&
+        (capture_frames_target < 1 || !capture_continuous)) {
+        std::fprintf(stderr, "--capture-frames needs --capture-continuous and "
+                             "a value >= 1\n");
         return 1;
     }
 
@@ -406,9 +430,49 @@ int main(int argc, char **argv)
     }
 
     if (capture_tap_name) {
-        auto pts = run_capture(capture_tap, capture_timeout_ms);
-        if (pts.empty())
-            return 1;
+        std::vector<CapturePoint> pts;
+
+        if (!capture_continuous) {
+            // Original one-shot behaviour, unchanged: exactly one
+            // arm/fill/read, empty result is fatal.
+            pts = run_capture(capture_tap, capture_timeout_ms);
+            if (pts.empty())
+                return 1;
+        } else {
+            // CAPTURE_DEPTH (hdl/pkg.vhd) is a fixed-size single-shot
+            // snapshot, often much shorter than a whole transfer - stitch
+            // consecutive fills together instead of settling for whichever
+            // slice happened to land in the buffer first. Stops on
+            // Ctrl-C (`running`, the same flag the live-trend loop below
+            // uses), on --capture-frames being reached, or naturally once
+            // a fill times out (nothing left driving MM2S - not treated as
+            // an error here, unlike the one-shot case above, since by then
+            // there is real accumulated data worth keeping).
+            uint32_t frames_start = rd(REG_FRAME_COUNT);
+            int batch_n = 0;
+
+            while (running) {
+                auto batch = run_capture(capture_tap, capture_timeout_ms);
+                if (batch.empty())
+                    break;   // natural end: nothing new arrived this fill
+
+                pts.insert(pts.end(), batch.begin(), batch.end());
+                batch_n++;
+
+                uint32_t frames_now = rd(REG_FRAME_COUNT) - frames_start;
+                std::fprintf(stderr,
+                             "  batch %d: +%zu points (%zu total), "
+                             "%u frame(s) since start\n",
+                             batch_n, batch.size(), pts.size(), frames_now);
+
+                if (capture_frames_target != -1 &&
+                    frames_now >= uint32_t(capture_frames_target))
+                    break;
+            }
+
+            if (pts.empty())
+                return 1;
+        }
 
         if (capture_out && !save_capture(pts, capture_out))
             return 1;

@@ -34,27 +34,6 @@ entity pll_2nd_order is
 end entity;
 
 architecture rtl of pll_2nd_order is
---Component declarations for the BRAM IP since Vivado is stubborn about its xil_defaultlib
-/*COMPONENT blk_mem_gen_0
-  PORT (
-    clka  : IN STD_LOGIC;
-    ena   : IN STD_LOGIC;
-    addra : IN STD_LOGIC_VECTOR(9 DOWNTO 0);
-    douta : OUT STD_LOGIC_VECTOR(15 DOWNTO 0) 
-  );
-END COMPONENT;
-
-
-
-COMPONENT blk_mem_gen_1
-  PORT (
-    clka  : IN STD_LOGIC;
-    ena   : IN STD_LOGIC;
-    addra : IN STD_LOGIC_VECTOR(9 DOWNTO 0);
-    douta : OUT STD_LOGIC_VECTOR(15 DOWNTO 0) 
-  );
-END COMPONENT;
-*/
 -- Loop gains, Q(C_GAIN_FRAC) fixed point: effective gain = K / 2**C_GAIN_FRAC.
 -- Raising C_GAIN_FRAC slows the loop and increases headroom; lowering it
 -- speeds acquisition and risks instability. Tune this rather than letting the
@@ -84,6 +63,7 @@ END COMPONENT;
 -- characterize_pll_detector() now negates its measured Kd before this
 -- design is derived, so a straight regenerate keeps the right sign
 -- automatically - this comment is here so it's obvious if it ever isn't.
+
 constant C_GAIN_FRAC : natural := 16;
 constant K1 : signed(15 downto 0) := to_signed(-810,16);
 constant K2 : signed(15 downto 0) := to_signed(803,16);
@@ -199,14 +179,8 @@ nco_sin <= -signed(sin_raw) when (quadrant_d = "10" or quadrant_d = "11")
            else signed(sin_raw);
 
 -- need to be synchronous with pll to match phase core carrier recovery
-/*cos_lut: blk_mem_gen_0
-    port map (
-             clka  => clk
-            ,addra => phase_lookup
-            ,douta => cos_raw
-            ,ena   => increment_phase--data_valid
-        );
- */
+
+
  
 cos_lut : xpm_memory_sprom
 generic map (

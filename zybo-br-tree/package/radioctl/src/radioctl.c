@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +148,13 @@ static volatile uint8_t  *buf;       /* reserved DDR, uncached */
 static unsigned long      buf_phys;
 static unsigned long      buf_size;
 
+/* board/common/zynq-zybo-z7-radio.dts's axi_dma_0 uio node routes exactly
+ * one IRQ - S2MM completion, by design (see that file's own comment: "RX
+ * completion is what an application needs to block on"). -1 if the open
+ * in main() failed for some reason; s2mm_wait() falls back to polling
+ * rather than hard-failing when that happens. */
+static int dma_irq_fd = -1;
+
 static uint32_t rd(int idx)             { return base[idx]; }
 static void     wr(int idx, uint32_t v) { base[idx] = v; }
 
@@ -273,38 +281,91 @@ static long now_ms(void)
 static void s2mm_arm(unsigned long dst_phys, uint32_t capacity)
 {
 	dma_wr(S2MM_DA, (uint32_t)dst_phys);
-	dma_wr(S2MM_DMACR, DMACR_RS);
+	/* DMACR_IOC_IRQEN/_ERR_IRQEN actually enable the DMA engine's physical
+	 * IRQ line - DMASR's status bits latch on completion/error regardless
+	 * of these, which is why plain polling never needed them, but
+	 * s2mm_wait()'s dma_irq_wait() blocks on a real interrupt now, and
+	 * without these that line never asserts: DMASR still reads IOC_IRQ +
+	 * IDLE correctly, poll()/read() just never wakes up for it, so every
+	 * wait silently runs to its own timeout regardless of how fast the
+	 * transfer actually completed. Found by exactly that symptom on
+	 * hardware - see docs/zybo_work.md. */
+	dma_wr(S2MM_DMACR, DMACR_RS | DMACR_IOC_IRQEN | DMACR_ERR_IRQEN);
 	dma_wr(S2MM_LENGTH, capacity);
 }
 
-/* Waits for the armed S2MM transfer. Bytes received, -1 error, -2 timeout. */
+/* Blocks until the S2MM UIO interrupt fires or timeout_ms elapses (rounded
+ * up to whatever's left of the caller's overall deadline). Returns 1 (an
+ * interrupt was consumed - dma_irq_reenable() must be called once DMASR's
+ * cause bit is cleared, see s2mm_wait()), 0 (timeout, nothing to
+ * re-enable), -1 (poll/read error - fatal, not worth retrying).
+ *
+ * uio_pdrv_genirq auto-masks the IRQ at the GIC the moment it fires, to
+ * stop a still-pending cause from storming the CPU with interrupts before
+ * userspace has had a chance to clear it at the device. A read() here is
+ * how that masked event is consumed (returns a 4-byte firing count, value
+ * not otherwise useful) - the standard UIO contract, matching
+ * board/common/zynq-zybo-z7-radio.dts's axi_dma_0 uio node. */
+static int dma_irq_wait(int timeout_ms)
+{
+	struct pollfd pfd = { .fd = dma_irq_fd, .events = POLLIN };
+	int rc = poll(&pfd, 1, timeout_ms);
+
+	if (rc < 0) {
+		fprintf(stderr, "poll uio%d: %s\n", dma_irq_fd, strerror(errno));
+		return -1;
+	}
+	if (rc == 0)
+		return 0;
+
+	uint32_t count;
+	if (read(dma_irq_fd, &count, sizeof(count)) != (ssize_t)sizeof(count)) {
+		fprintf(stderr, "read uio%d: %s\n", dma_irq_fd, strerror(errno));
+		return -1;
+	}
+	return 1;
+}
+
+/* Un-masks the IRQ uio_pdrv_genirq masked in dma_irq_wait() above, so the
+ * NEXT S2MM completion also wakes this up rather than only the first one
+ * ever. Call this AFTER the hardware's own interrupt-cause bit (DMASR's
+ * w1c) is cleared, not before - re-enabling first risks an already-pending
+ * cause re-triggering before this process is back to waiting on it. */
+static void dma_irq_reenable(void)
+{
+	uint32_t one = 1;
+	if (write(dma_irq_fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
+		fprintf(stderr, "warning: failed to re-enable DMA IRQ: %s\n",
+			strerror(errno));
+}
+
+/* Waits for the armed S2MM transfer. Bytes received, -1 error, -2 timeout.
+ *
+ * Interrupt-driven when dma_irq_fd is open (map_datapath() sets it up;
+ * see board/common/zynq-zybo-z7-radio.dts's axi_dma_0 comment for why only
+ * S2MM has an IRQ routed at all) - falls back to the original 1ms poll
+ * loop if it isn't, rather than hard-failing. The point of this over the
+ * old pure-poll version isn't throughput, it's LATENCY: re-arming S2MM for
+ * the next frame as fast as possible after this one completes matters once
+ * frames can arrive back-to-back (rx_frame_buffer is single-shot - a frame
+ * completing before the previous one is re-armed for is a real, observed
+ * OVERFLOW, not a hypothetical one - see docs/zybo_work.md's "WHERE THINGS
+ * STAND" for the capture that found it). A 1ms poll tick was up to 1ms of
+ * pure, avoidable added latency on every single frame; this removes it. */
 static long s2mm_wait(int timeout_ms)
 {
 	long deadline = now_ms() + timeout_ms;
 
 	for (;;) {
-		uint32_t sr = dma_rd(S2MM_DMASR);
-
-		if (sr & DMASR_ERRORS) {
-			fprintf(stderr, "DMA error, DMASR=0x%08x%s%s%s\n", sr,
-				(sr & DMASR_DMAINTERR) ? " int-err" : "",
-				(sr & DMASR_DMASLVERR) ? " slave-err" : "",
-				(sr & DMASR_DMADECERR) ? " decode-err" : "");
-			return -1;
-		}
-
-		if (sr & DMASR_IOC_IRQ) {
-			dma_wr(S2MM_DMASR, DMASR_IOC_IRQ);  /* w1c */
-			return (long)dma_rd(S2MM_LENGTH);
-		}
-
-		if (now_ms() > deadline) {
+		long remaining = deadline - now_ms();
+		if (remaining <= 0) {
 			/* DMASR at the moment of giving up - the one piece of
 			 * evidence that tells "DMA never saw a stream at all"
 			 * (IDLE, no SGIncld/DMAIntErr) apart from "something
 			 * else is wrong". Silently discarding sr here was the
 			 * gap that made every previous timeout look identical
 			 * regardless of cause. */
+			uint32_t sr = dma_rd(S2MM_DMASR);
 			fprintf(stderr, "    S2MM_DMASR=0x%08x at timeout"
 					"%s%s\n", sr,
 				(sr & DMASR_HALTED) ? " HALTED" : "",
@@ -312,7 +373,41 @@ static long s2mm_wait(int timeout_ms)
 			return -2;   /* timeout, not an error */
 		}
 
-		usleep(1000);
+		int woke_on_irq = 0;
+		if (dma_irq_fd >= 0) {
+			int got = dma_irq_wait((int)remaining);
+			if (got < 0)
+				return -1;
+			if (got == 0)
+				continue;   /* this slice's timeout - re-check the real deadline */
+			woke_on_irq = 1;
+		} else {
+			usleep(1000);   /* fallback: no IRQ fd available */
+		}
+
+		uint32_t sr = dma_rd(S2MM_DMASR);
+
+		if (sr & DMASR_ERRORS) {
+			fprintf(stderr, "DMA error, DMASR=0x%08x%s%s%s\n", sr,
+				(sr & DMASR_DMAINTERR) ? " int-err" : "",
+				(sr & DMASR_DMASLVERR) ? " slave-err" : "",
+				(sr & DMASR_DMADECERR) ? " decode-err" : "");
+			if (woke_on_irq)
+				dma_irq_reenable();
+			return -1;
+		}
+
+		if (sr & DMASR_IOC_IRQ) {
+			dma_wr(S2MM_DMASR, DMASR_IOC_IRQ);  /* w1c, clear the cause first */
+			if (woke_on_irq)
+				dma_irq_reenable();          /* ... then unmask for next time */
+			return (long)dma_rd(S2MM_LENGTH);
+		}
+
+		/* Woke up (interrupt or poll tick) but nothing conclusive -
+		 * re-enable whatever we consumed and loop back to wait again. */
+		if (woke_on_irq)
+			dma_irq_reenable();
 	}
 }
 
@@ -642,11 +737,67 @@ static int check_frame(const volatile uint8_t *p, long got,
 	return bad;
 }
 
-static void mm2s_play(unsigned long src_phys, uint32_t bytes)
+/* MM2S has no IRQ routed - board/common/zynq-zybo-z7-radio.dts's own
+ * comment on axi_dma_0 says why: "RX completion is what an application
+ * needs to block on; the TX side is polled." Same shape s2mm_wait() used
+ * before the S2MM path went interrupt-driven. */
+static long mm2s_wait(int timeout_ms)
 {
-	dma_wr(MM2S_SA, (uint32_t)src_phys);
-	dma_wr(MM2S_DMACR, DMACR_RS);
-	dma_wr(MM2S_LENGTH, bytes);   /* writing the length starts it */
+	long deadline = now_ms() + timeout_ms;
+
+	for (;;) {
+		uint32_t sr = dma_rd(MM2S_DMASR);
+
+		if (sr & DMASR_ERRORS) {
+			fprintf(stderr, "MM2S DMA error, DMASR=0x%08x%s%s%s\n", sr,
+				(sr & DMASR_DMAINTERR) ? " int-err" : "",
+				(sr & DMASR_DMASLVERR) ? " slave-err" : "",
+				(sr & DMASR_DMADECERR) ? " decode-err" : "");
+			return -1;
+		}
+		if (sr & DMASR_IDLE)
+			return 0;
+
+		if (now_ms() > deadline) {
+			fprintf(stderr, "    MM2S_DMASR=0x%08x at timeout"
+					"%s%s\n", sr,
+				(sr & DMASR_HALTED) ? " HALTED" : "",
+				(sr & DMASR_IDLE)   ? " IDLE"   : "");
+			return -2;
+		}
+		usleep(1000);
+	}
+}
+
+/* Conservative regardless of how c_sg_length_width is actually configured -
+ * defends against the *old* 14-bit IP default (max 16383 bytes) coming
+ * back in some future rebuild, not just today's 23-bit setting
+ * (create_project.tcl). A single descriptor transfer silently truncates/
+ * wraps past its configured max instead of erroring - see docs/zybo_work.md
+ * for the capture that found this the hard way (24560 bytes requested,
+ * 8176 actually transferred, no error anywhere) - so this splits rather
+ * than trusts the caller to stay under any particular limit. */
+#define MM2S_MAX_XFER_BYTES 16000u
+
+static int mm2s_play(unsigned long src_phys, uint32_t bytes)
+{
+	unsigned long off = 0;
+
+	while (off < bytes) {
+		uint32_t this_len = bytes - off;
+		if (this_len > MM2S_MAX_XFER_BYTES)
+			this_len = MM2S_MAX_XFER_BYTES;
+
+		dma_wr(MM2S_SA, (uint32_t)(src_phys + off));
+		dma_wr(MM2S_DMACR, DMACR_RS);
+		dma_wr(MM2S_LENGTH, this_len);   /* writing the length starts it */
+
+		if (mm2s_wait(2000) < 0)
+			return -1;
+
+		off += this_len;
+	}
+	return 0;
 }
 
 static int cmd_loopback(const char *stim, const char *chunkf, const char *expectf,
@@ -726,10 +877,19 @@ static int cmd_loopback(const char *stim, const char *chunkf, const char *expect
 		printf("\nchunk %d: samples %lu..%lu\n", c + 1, chunks[c].first,
 		       chunks[c].first + chunks[c].count - 1);
 
-		/* Capture first, then play - the other order races the frame. */
+		/* Capture first, then play - the other order races the frame.
+		 * mm2s_play() now blocks until MM2S itself finishes (needed
+		 * for its own internal auto-split, see its definition) - that
+		 * only bounds how long PLAYBACK takes to hand bytes off, the
+		 * DSP chain and S2MM capture continue in hardware regardless
+		 * of what software is doing, so s2mm_wait() below still does
+		 * the real waiting for the receiver to actually finish. */
 		s2mm_arm(rx_phys, rx_cap);
-		mm2s_play(tx_phys + chunks[c].first * 4,
-			  (uint32_t)(chunks[c].count * 4));
+		if (mm2s_play(tx_phys + chunks[c].first * 4,
+			      (uint32_t)(chunks[c].count * 4)) < 0) {
+			rc = 1;
+			break;
+		}
 
 		long got = s2mm_wait(timeout_ms);
 
@@ -821,6 +981,76 @@ done:
 	return rc;
 }
 
+/*
+ * Plays a stimulus file through MM2S ONLY - no S2MM arm/wait/capture at
+ * all, unlike loopback. Exists so rx/rxloop can be exercised as a genuinely
+ * independent listener against a real playback source, in a second
+ * terminal, without two processes fighting over the same S2MM DMA
+ * registers - running loopback and rxloop at once does exactly that (see
+ * docs/zybo_work.md's "WHERE THINGS STAND" for why that pairing was never
+ * a clean test).
+ *
+ * Deliberately does NOT call dma_reset(): a soft reset in either DMACR
+ * resets the WHOLE engine, both channels (see the comment above
+ * MM2S_DMACR/S2MM_DMACR), which would silently stomp on whatever a
+ * concurrently-running rx/rxloop has armed on S2MM. This command touches
+ * MM2S registers only, ever.
+ */
+static int cmd_play(const char *stim, const char *chunkf, int gap_ms)
+{
+	struct chunk *chunks = NULL, one;
+	int n_chunks;
+	int rc = 0;
+
+	if (map_datapath() < 0)
+		return 1;
+
+	long n_samples = load_stimulus(stim);
+	if (n_samples < 0)
+		return 1;
+	printf("stimulus    %ld samples from %s\n", n_samples, stim);
+
+	if (chunkf) {
+		n_chunks = load_chunks(chunkf, &chunks, (unsigned long)n_samples);
+		if (n_chunks < 0)
+			return 1;
+		printf("chunks      %d, from %s\n", n_chunks, chunkf);
+	} else {
+		one.first = 0;
+		one.count = (unsigned long)n_samples;
+		chunks = &one;
+		n_chunks = 1;
+		printf("chunks      none given - playing the whole file as one "
+		       "transfer\n");
+	}
+
+	unsigned long tx_phys = buf_phys + TX_REGION_OFF;
+	printf("buffer      play 0x%08lx\n", tx_phys);
+
+	for (int c = 0; c < n_chunks; c++) {
+		printf("chunk %d: samples %lu..%lu\n", c + 1, chunks[c].first,
+		       chunks[c].first + chunks[c].count - 1);
+
+		if (mm2s_play(tx_phys + chunks[c].first * 4,
+			      (uint32_t)(chunks[c].count * 4)) < 0) {
+			rc = 1;
+			break;
+		}
+
+		/* Optional pacing between chunks - gives a listener in
+		 * another terminal (rx/rxloop) more slack to re-arm than
+		 * mm2s_play()'s own completion timing alone would, if its
+		 * per-frame processing turns out to need it. 0 = back-to-back,
+		 * same timing loopback itself uses between chunks. */
+		if (gap_ms > 0 && c + 1 < n_chunks)
+			usleep((useconds_t)gap_ms * 1000);
+	}
+
+	if (chunks != &one)
+		free(chunks);
+	return rc;
+}
+
 static void dump(void)
 {
 	uint32_t id = rd(REG_ID), st = rd(REG_STATUS), md = rd(REG_MODE);
@@ -888,6 +1118,17 @@ static void usage(const char *p)
 		"    --out <file>        write captured frames here, metadata included\n"
 		"    --timeout <ms>      per-frame capture timeout (default 2000)\n"
 		"\n"
+		"  play <samples.dat> [options]\n"
+		"                        play a sample file through MM2S ONLY - no\n"
+		"                        S2MM arm/wait/capture at all, unlike loopback.\n"
+		"                        Pair with rx/rxloop running in another\n"
+		"                        terminal to test the receive path against a\n"
+		"                        real, independent listener - running loopback\n"
+		"                        and rxloop at the same time instead makes them\n"
+		"                        fight over the same S2MM registers.\n"
+		"    --chunks <file>     one playback transfer per frame (as loopback)\n"
+		"    --gap <ms>          pause between chunks (default 0, back-to-back)\n"
+		"\n"
 		"registers: ", p);
 	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
 		fprintf(stderr, "%s%s", i ? ", " : "", regs[i].name);
@@ -903,7 +1144,7 @@ static int map_datapath(void)
 		fprintf(stderr, "no UIO device at 0x%08lx (the AXI DMA)\n", DMA_PHYS);
 		return -1;
 	}
-	dma = uio_map(idx, DMA_MAP_SIZE, NULL);
+	dma = uio_map(idx, DMA_MAP_SIZE, &dma_irq_fd);
 	if (dma == MAP_FAILED)
 		return -1;
 
@@ -1051,6 +1292,28 @@ int main(int argc, char **argv)
 		}
 
 		rc = cmd_loopback(stim, chunkf, expectf, outf, timeout);
+
+	} else if (!strcmp(cmd, "play") && argi + 1 < argc) {
+		const char *stim = argv[argi + 1];
+		const char *chunkf = NULL;
+		int gap_ms = 0;
+
+		for (int a = argi + 2; a < argc; a++) {
+			int has_val = a + 1 < argc;
+
+			if (!strcmp(argv[a], "--chunks") && has_val)
+				chunkf = argv[++a];
+			else if (!strcmp(argv[a], "--gap") && has_val)
+				gap_ms = atoi(argv[++a]);
+			else {
+				fprintf(stderr, "unknown or incomplete option: %s\n",
+					argv[a]);
+				usage(argv[0]);
+				return 1;
+			}
+		}
+
+		rc = cmd_play(stim, chunkf, gap_ms);
 
 	} else if (!strcmp(cmd, "rx") || !strcmp(cmd, "rxloop")) {
 		int loop = !strcmp(cmd, "rxloop");
