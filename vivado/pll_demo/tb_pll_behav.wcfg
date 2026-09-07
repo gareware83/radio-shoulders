@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<wave_config>
+   <wave_state>
+   </wave_state>
+   <db_ref_list>
+      <db_ref path="tb_pll_behav.wdb" id="1">
+         <top_modules>
+            <top_module name="tb_pll" />
+            <top_module name="vcomponents" />
+         </top_modules>
+      </db_ref>
+   </db_ref_list>
+   <zoom_setting>
+      <ZoomStartTime time="0.000000000 ms"></ZoomStartTime>
+      <ZoomEndTime time="8.500000001 ms"></ZoomEndTime>
+      <Cursor1Time time="8.500000000 ms"></Cursor1Time>
+   </zoom_setting>
+   <column_width_setting>
+      <NameColumnWidth column_width="178"></NameColumnWidth>
+      <ValueColumnWidth column_width="66"></ValueColumnWidth>
+   </column_width_setting>
+   <WVObjectSize size="3" />
+   <wvobject type="logic" fp_name="/tb_pll/test_pass">
+      <obj_property name="ElementShortName">test_pass</obj_property>
+      <obj_property name="ObjectShortName">test_pass</obj_property>
+   </wvobject>
+   <wvobject type="logic" fp_name="/tb_pll/test_done">
+      <obj_property name="ElementShortName">test_done</obj_property>
+      <obj_property name="ObjectShortName">test_done</obj_property>
+   </wvobject>
+   <wvobject type="group" fp_name="group2963">
+      <obj_property name="label">uut</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/tb_pll/tb_inst/uut/clk">
+         <obj_property name="ElementShortName">clk</obj_property>
+         <obj_property name="ObjectShortName">clk</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_pll/tb_inst/uut/rst">
+         <obj_property name="ElementShortName">rst</obj_property>
+         <obj_property name="ObjectShortName">rst</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_pll/tb_inst/uut/data_valid">
+         <obj_property name="ElementShortName">data_valid</obj_property>
+         <obj_property name="ObjectShortName">data_valid</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/I_in">
+         <obj_property name="ElementShortName">I_in[15:0]</obj_property>
+         <obj_property name="ObjectShortName">I_in[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/dbg_nco_cos">
+         <obj_property name="ElementShortName">dbg_nco_cos[15:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_nco_cos[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/Q_in">
+         <obj_property name="ElementShortName">Q_in[15:0]</obj_property>
+         <obj_property name="ObjectShortName">Q_in[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/dbg_nco_sin">
+         <obj_property name="ElementShortName">dbg_nco_sin[15:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_nco_sin[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/I_out">
+         <obj_property name="ElementShortName">I_out[15:0]</obj_property>
+         <obj_property name="ObjectShortName">I_out[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/Q_out">
+         <obj_property name="ElementShortName">Q_out[15:0]</obj_property>
+         <obj_property name="ObjectShortName">Q_out[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/dbg_u">
+         <obj_property name="ElementShortName">dbg_u[31:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_u[31:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/dbg_phase_err">
+         <obj_property name="ElementShortName">dbg_phase_err[31:0]</obj_property>
+         <obj_property name="ObjectShortName">dbg_phase_err[31:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/phase_acc">
+         <obj_property name="ElementShortName">phase_acc[31:0]</obj_property>
+         <obj_property name="ObjectShortName">phase_acc[31:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/quadrant">
+         <obj_property name="ElementShortName">quadrant[1:0]</obj_property>
+         <obj_property name="ObjectShortName">quadrant[1:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/raw_idx">
+         <obj_property name="ElementShortName">raw_idx[7:0]</obj_property>
+         <obj_property name="ObjectShortName">raw_idx[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/phase_lookup">
+         <obj_property name="ElementShortName">phase_lookup[7:0]</obj_property>
+         <obj_property name="ObjectShortName">phase_lookup[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/I_rot">
+         <obj_property name="ElementShortName">I_rot[15:0]</obj_property>
+         <obj_property name="ObjectShortName">I_rot[15:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/Q_rot">
+         <obj_property name="ElementShortName">Q_rot[15:0]</obj_property>
+         <obj_property name="ObjectShortName">Q_rot[15:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/e_prev">
+         <obj_property name="ElementShortName">e_prev[31:0]</obj_property>
+         <obj_property name="ObjectShortName">e_prev[31:0]</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_pll/tb_inst/uut/C_GAIN_FRAC">
+         <obj_property name="ElementShortName">C_GAIN_FRAC</obj_property>
+         <obj_property name="ObjectShortName">C_GAIN_FRAC</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/K1">
+         <obj_property name="ElementShortName">K1[15:0]</obj_property>
+         <obj_property name="ObjectShortName">K1[15:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_pll/tb_inst/uut/K2">
+         <obj_property name="ElementShortName">K2[15:0]</obj_property>
+         <obj_property name="ObjectShortName">K2[15:0]</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_pll/tb_inst/uut/C_PROD_W">
+         <obj_property name="ElementShortName">C_PROD_W</obj_property>
+         <obj_property name="ObjectShortName">C_PROD_W</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_pll/tb_inst/uut/C_SUM_W">
+         <obj_property name="ElementShortName">C_SUM_W</obj_property>
+         <obj_property name="ObjectShortName">C_SUM_W</obj_property>
+      </wvobject>
+   </wvobject>
+</wave_config>
