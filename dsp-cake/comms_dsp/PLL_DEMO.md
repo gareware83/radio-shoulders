@@ -8,7 +8,7 @@
 You can run python3 sim_out_view.py ../results/pll_trace.csv --show to generate the Python simdata plot.
 
 ## Intro
-A small, self-contained 2nd-order carrier-recovery PLL example pulled from a larger practice (for fun) software-defined-radio
+A small, for code review only (no project .tcl), 2nd-order carrier-recovery PLL example pulled from a larger practice (for fun) software-defined-radio
 project, written in synthesizable VHDL,
 verified against a simple sine-wave stimulus with a self-checking testbench.
 
@@ -16,14 +16,15 @@ This file explains what the design is and how the test proves it works. It's
 written to stand on its own without conext from the rest of the parent
 project.
 
-The parent project is on the following branch for anyone intersted in reviewing the state of the larger design. 
+The parent project targets Zybo Z7-20 (xc7z020clg400-1) dev board and lives
+on the following branch for anyone intersted in reviewing the state of the larger design. 
 [Radio-shoulders](https://github.com/gareware83/radio-shoulders)
 
 The development is accelerated using Claude AI code, steered by my professional experience in FPGA, DSP and SDR design. 
 
 Algorithm reference: Digital Communications: A discrete Time Approach, Michael Rice
 
-## What this is
+## Algorithm
 
 `pll_2nd_order.vhd` is a carrier-recovery loop: given a complex baseband
 signal (`I`, `Q`) whose phase is rotating at some unknown, roughly-constant
@@ -87,8 +88,7 @@ samples of the run:
    same scale-invariant lock-quality ratio the parent project's receiver
    uses everywhere else (`rx_quality.vhd`). A ratio near 1.0 means the
    output settled near a diagonal (`I≈Q` in magnitude); a ratio near 0
-   would mean it collapsed onto one axis instead, locking onto the wrong, unstable equilibrium. The parent project runs the full RX chain on a
-   Zybo Z7-20 (xc7z020clg400-1) dev board
+   would mean it collapsed onto one axis instead, locking onto the wrong, unstable equilibrium. 
 
 Both have to pass for the testbench to report `PASS`.
 
