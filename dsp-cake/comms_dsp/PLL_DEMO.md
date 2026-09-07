@@ -8,8 +8,8 @@
 You can run python3 sim_out_view.py ../results/pll_trace.csv --show to generate the Python simdata plot.
 
 ## Intro
-A small, for code review only (no project .tcl), 2nd-order carrier-recovery PLL example pulled from a larger practice (for fun) software-defined-radio
-project, written in synthesizable VHDL,
+A small, stand alone, 2nd-order carrier-recovery PLL example project pulled from a larger practice (for fun but hardware-tested) software-defined-radio
+design, written in synthesizable VHDL,
 verified against a simple sine-wave stimulus with a self-checking testbench.
 
 This file explains what the design is and how the test proves it works. It's
@@ -106,3 +106,5 @@ behavior, not just trusted from a summary number.
 | `test_bench/tb_pll.vhd` | Top-level testbench wrapper (reports PASS/FAIL) |
 | `test_bench/sin_cos_lut_gen.py` | Generates both the DUT's NCO lookup tables and the test stimulus (`--stimulus`) |
 | `test_bench/loop_model.py` | Python-level loop model used to derive/validate the loop filter gains and characterize the phase detector before committing anything to RTL |
+| `vivado/pll_demo/create_project.tcl` | Project script to create project and run simulation in Vivado 2022.2 |
+| `vivado/pll_demo/tb_pll_behav.wcfg` | Waveform file for sim |
