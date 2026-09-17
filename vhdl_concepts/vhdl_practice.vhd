@@ -1,8 +1,10 @@
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.numeric_std.all;
+Library xpm;
+use xpm.vcomponents.all;
 library work;
-use work.all;
+use work.vhdl_practice_pkg.all;
 
 entity vhdl_practice is
 
@@ -19,7 +21,8 @@ architecture Behavioral of vhdl_practice is
     constant c_seed     : std_logic_vector(c_lfsr_msb downto 0) := x"FF";
     constant c_poly     : std_logic_vector(c_lfsr_msb downto 0) := x"AA";
     constant c_chips_per_bit : integer := 8;
-   
+    
+  
     
     signal clk  : std_logic := '0';
     signal rst  : std_logic := '1';
@@ -33,29 +36,31 @@ architecture Behavioral of vhdl_practice is
     signal pseudo_rand : std_logic;
     signal tx_data_symbol     : std_logic_vector(7 downto 0) := x"AA"; --simple counter as data source for data bit spreading (chipping) and recovery
     signal data_valid  : std_logic := '0';
-    signal chip_count   : integer range 0 to c_chips_per_bit - 1 :=0;
+    
+    --spreader signals
+    signal chip_count   : integer range 0 to c_chips_per_bit - 1 :=0;--8:1 chipping ratio
     --signal chipped_data : std_logic := '0';
     signal chipped_buffer : std_logic_vector(c_chips_per_bit -1 downto 0) := (others => '0');
     signal chipped_byte   : std_logic_vector(c_chips_per_bit -1 downto 0) := (others => '0');
     signal lfsr_en        : std_logic := '0';
     
+    -- despreader signals
     signal rx_chip_count :  integer range 0 to c_chips_per_bit - 1 :=0;
     signal corr_accum    : signed(4 downto 0);
     signal rx_data_valid : std_logic;
     signal rx_data_bit   : std_logic;
     signal rx_data_symbol : std_logic_vector(7 downto 0) := (others => '0');
     signal prev_pn        : std_logic := '0';
-
-    --function to map to -1,1 encoding
-    function to_bipolar(b : std_logic) return signed is
-    begin
-        if b = '0' then
-            return to_signed(-1,2);
-        else
-            return to_signed(1,2);
-        end if;
-    end function;        
-     
+    
+    signal lfm_sig_en     : std_logic; 
+    signal lfm_taps_valid : std_logic;
+    signal lfm_taps       : std_logic_vector(15 downto 0); -- need to parameterize this to power of lfm chirp  2**(chirp_msb+1)
+    signal lfm_data_valid : std_logic;
+    signal lfm_bit_in     : std_logic;
+    
+    signal pulse_out      : std_logic_vector(15 downto 0);
+    signal corr_valid     : std_logic;
+    
 begin
     
 
@@ -118,7 +123,7 @@ spreading_process : process(clk, arst)
     variable chipped_data : std_logic;
 begin
     if arst = '1' then
-        tx_data_symbol <= x"CC" ;--a shift from msb to lsb will toggle the lsb and show up as AA or 55, easy to check by eye
+        tx_data_symbol <= x"AA" ;--a shift from msb to lsb will toggle the lsb and show up as AA or 55, easy to check by eye
         chip_count <= 0;
         data_valid <= '0';
         lfsr_en <= '1';
@@ -167,10 +172,7 @@ begin
         --Bit expand for addition (+ is a good test to make sure you have all your signals typed correctly)
         accum := corr_accum + resize(mult, 5);
         if rx_chip_count = c_chips_per_bit -1 then
-            rx_chip_count <= 0;
-            
-            
-            
+            rx_chip_count <= 0;           
             rx_data_valid <= '1';
             corr_accum <= (others => '0');
             --select the signed bit, whatever sign the accumulator is at the end of the symbol correlation is the user data bit in bipolar encoding
@@ -189,6 +191,7 @@ begin
     
 end process;
 
+
 spreading_lfsr : entity work.lfsr
     generic map(
         G_SEED => c_seed,
@@ -202,10 +205,41 @@ spreading_lfsr : entity work.lfsr
         ,enable => lfsr_en
     );
 
+lfm_inst : entity work.lfm
+    generic map (
+         G_MSB => 3 --paramaterize to 2**(chirp_msb+1)
+        ,G_LEN => 16
+    )
+    port map (
+    
+         clk        => clk
+        ,arst       => arst
+        ,data_valid => lfm_data_valid
+        ,taps_valid => lfm_taps_valid
+        ,taps       => lfm_taps
+        ,bit_in     => lfm_bit_in
+        ,pulse_out  => pulse_out
+        ,corr_valid => corr_valid
+    );
+lfm_sig_gen : entity work.lfm_signal_gen
+    generic map (
+         G_CHIRP_MSB => 3
+    )
+    port map (
+         clk              => clk
+        ,arst             => arst
+        ,lfm_sig_en       => lfm_sig_en 
+        ,mf_taps_valid    => lfm_taps_valid
+        ,mf_taps          => lfm_taps
+        ,lfm_signal_valid => lfm_data_valid
+        ,lfm_signal       => lfm_bit_in
+    );
 sim_t : process
 begin
     wait for sim_time;
     sim_done <= '1';
+    arst <= '0';
+    lfm_sig_en  <= '0';
     wait;
 end process;
 

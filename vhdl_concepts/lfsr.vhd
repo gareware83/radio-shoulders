@@ -6,10 +6,10 @@ use work.all;
 
 entity lfsr is 
     Generic (
-    --defauls generics
-        G_SEED : std_logic_vector(7 downto 0) := x"FF";
+    --default generics
         G_MSB  : integer := 7;
-        G_POLY : std_logic_vector(7 downto 0) := x"AA"-- polynomial bit i set, lfsr_reg(i) is a tap
+        G_SEED : std_logic_vector(G_MSB downto 0) := x"FF";
+        G_POLY : std_logic_vector(G_MSB downto 0) := x"AA"-- polynomial bit i set, lfsr_reg(i) is a tap
     );
     Port (
         clk      : in std_logic;
