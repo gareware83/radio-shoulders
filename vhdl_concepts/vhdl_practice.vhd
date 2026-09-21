@@ -21,6 +21,8 @@ architecture Behavioral of vhdl_practice is
     constant c_seed     : std_logic_vector(c_lfsr_msb downto 0) := x"FF";
     constant c_poly     : std_logic_vector(c_lfsr_msb downto 0) := x"AA";
     constant c_chips_per_bit : integer := 8;
+    constant c_chirp_msb : integer := 3;
+    constant c_chirp_len : integer := 2**lfsr_size(c_chirp_msb + 1);
     
   
     
@@ -52,14 +54,14 @@ architecture Behavioral of vhdl_practice is
     signal rx_data_symbol : std_logic_vector(7 downto 0) := (others => '0');
     signal prev_pn        : std_logic := '0';
     
-    signal lfm_sig_en     : std_logic; 
-    signal lfm_taps_valid : std_logic;
-    signal lfm_taps       : std_logic_vector(15 downto 0); -- need to parameterize this to power of lfm chirp  2**(chirp_msb+1)
-    signal lfm_data_valid : std_logic;
-    signal lfm_bit_in     : std_logic;
+    signal lfm_sig_en     : std_logic := '0'; 
+    signal lfm_taps_valid : std_logic := '0';
+    signal lfm_taps       : std_logic_vector(c_chirp_len - 1 downto 0); -- need to parameterize this to power of lfm chirp  2**(chirp_msb+1)
+    signal lfm_data_valid : std_logic := '0';
+    signal lfm_bit_in     : std_logic := '0' ;
     
-    signal pulse_out      : std_logic_vector(15 downto 0);
-    signal corr_valid     : std_logic;
+    signal lfm_corr_out   : signed(c_chirp_len downto 0);  -- lfm's corr_out is signed(G_LEN downto 0), G_LEN=16 below
+    signal corr_valid     : std_logic := '0';
     
 begin
     
@@ -77,8 +79,7 @@ end process;
 
 rst_process : process
 begin
-    sim_done <= '0';
-    sim_passed <= '0';
+   
     wait for 2 * clk_period;
     rst <= '1';
     wait for 2 * clk_period;
@@ -203,12 +204,27 @@ spreading_lfsr : entity work.lfsr
         ,arst     => arst
         ,pn_out => pseudo_rand
         ,enable => lfsr_en
+        ,reload => '0'
     );
+
+lfm_start : process(clk, arst)
+begin
+    if arst = '1' then
+        lfm_sig_en <= '0';
+    elsif rising_edge(clk) then
+        lfm_sig_en <= '1';
+        --if sim_done <= '1' then
+        --    lfm_sig_en  <= '0';
+        --else 
+        --    lfm_sig_en <= '1';
+        --end if;
+    end if;
+end process;
 
 lfm_inst : entity work.lfm
     generic map (
-         G_MSB => 3 --paramaterize to 2**(chirp_msb+1)
-        ,G_LEN => 16
+         G_MSB => c_chirp_msb
+        ,G_LEN => c_chirp_len--paramaterize to 2**(chirp_msb+1)
     )
     port map (
     
@@ -218,12 +234,14 @@ lfm_inst : entity work.lfm
         ,taps_valid => lfm_taps_valid
         ,taps       => lfm_taps
         ,bit_in     => lfm_bit_in
-        ,pulse_out  => pulse_out
+        ,corr_out  => lfm_corr_out
         ,corr_valid => corr_valid
     );
+    
 lfm_sig_gen : entity work.lfm_signal_gen
     generic map (
-         G_CHIRP_MSB => 3
+          G_CHIRP_MSB => c_chirp_msb
+         ,G_CHIRP_LEN => c_chirp_len
     )
     port map (
          clk              => clk
@@ -232,14 +250,12 @@ lfm_sig_gen : entity work.lfm_signal_gen
         ,mf_taps_valid    => lfm_taps_valid
         ,mf_taps          => lfm_taps
         ,lfm_signal_valid => lfm_data_valid
-        ,lfm_signal       => lfm_bit_in
+        ,lfm_signal_out   => lfm_bit_in
     );
 sim_t : process
 begin
     wait for sim_time;
-    sim_done <= '1';
-    arst <= '0';
-    lfm_sig_en  <= '0';
+    sim_done <= '1';  
     wait;
 end process;
 

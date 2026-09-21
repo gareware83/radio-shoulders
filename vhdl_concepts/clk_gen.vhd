@@ -57,10 +57,11 @@ begin
         
         -- Outputs
         CLKOUT1  => clk_out1_unbuf,
-        CLKOUT2  => clk_out2_unbuf
+        CLKOUT2  => clk_out2_unbuf,
+        pwrdwn   => open
     );
 
     -- Output buffers (required to put the derived clocks onto global routing networks)
-    clkout1_buf : BUFG port map (I => clk_out1_unbuf, O => clk_out1);
-    clkout2_buf : BUFG port map (I => clk_out2_unbuf, O => clk_out2);
+    clkout1_buf : BUFG port map (I => clk_out1_unbuf, O => clk_out_1);
+    clkout2_buf : BUFG port map (I => clk_out2_unbuf, O => clk_out_2);
 end Behavioral;

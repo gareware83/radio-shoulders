@@ -6,19 +6,21 @@
       <db_ref path="tb_vhdl_practice_behav.wdb" id="1">
          <top_modules>
             <top_module name="tb_vhdl_practice" />
+            <top_module name="vcomponents" />
+            <top_module name="vhdl_practice_pkg" />
          </top_modules>
       </db_ref>
    </db_ref_list>
    <zoom_setting>
-      <ZoomStartTime time="0.000000 us"></ZoomStartTime>
-      <ZoomEndTime time="768.437088 us"></ZoomEndTime>
-      <Cursor1Time time="1.000000 us"></Cursor1Time>
+      <ZoomStartTime time="0.000000000 ms"></ZoomStartTime>
+      <ZoomEndTime time="8.000000001 ms"></ZoomEndTime>
+      <Cursor1Time time="8.000000000 ms"></Cursor1Time>
    </zoom_setting>
    <column_width_setting>
-      <NameColumnWidth column_width="126"></NameColumnWidth>
+      <NameColumnWidth column_width="134"></NameColumnWidth>
       <ValueColumnWidth column_width="66"></ValueColumnWidth>
    </column_width_setting>
-   <WVObjectSize size="29" />
+   <WVObjectSize size="9" />
    <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/sim_passed">
       <obj_property name="ElementShortName">sim_passed</obj_property>
       <obj_property name="ObjectShortName">sim_passed</obj_property>
@@ -39,110 +41,349 @@
       <obj_property name="ElementShortName">arst</obj_property>
       <obj_property name="ObjectShortName">arst</obj_property>
    </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/a">
-      <obj_property name="ElementShortName">a[15:0]</obj_property>
-      <obj_property name="ObjectShortName">a[15:0]</obj_property>
-      <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/b">
-      <obj_property name="ElementShortName">b[15:0]</obj_property>
-      <obj_property name="ObjectShortName">b[15:0]</obj_property>
-      <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/sum">
-      <obj_property name="ElementShortName">sum[17:0]</obj_property>
-      <obj_property name="ObjectShortName">sum[17:0]</obj_property>
-      <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/prod">
-      <obj_property name="ElementShortName">prod[31:0]</obj_property>
-      <obj_property name="ObjectShortName">prod[31:0]</obj_property>
-      <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/prod_1">
-      <obj_property name="ElementShortName">prod_1[31:0]</obj_property>
-      <obj_property name="ObjectShortName">prod_1[31:0]</obj_property>
-      <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/prod_q1_15">
-      <obj_property name="ElementShortName">prod_q1_15[15:0]</obj_property>
-      <obj_property name="ObjectShortName">prod_q1_15[15:0]</obj_property>
-      <obj_property name="Radix">HEXRADIX</obj_property>
-      <obj_property name="Reversed">false</obj_property>
-   </wvobject>
-   <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/clk_period">
-      <obj_property name="ElementShortName">clk_period</obj_property>
-      <obj_property name="ObjectShortName">clk_period</obj_property>
-   </wvobject>
-   <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/sim_time">
-      <obj_property name="ElementShortName">sim_time</obj_property>
-      <obj_property name="ObjectShortName">sim_time</obj_property>
-   </wvobject>
-   <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/pseudo_rand">
-      <obj_property name="ElementShortName">pseudo_rand</obj_property>
-      <obj_property name="ObjectShortName">pseudo_rand</obj_property>
-   </wvobject>
-   <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/c_lfsr_msb">
-      <obj_property name="ElementShortName">c_lfsr_msb</obj_property>
-      <obj_property name="ObjectShortName">c_lfsr_msb</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/c_seed">
-      <obj_property name="ElementShortName">c_seed[7:0]</obj_property>
-      <obj_property name="ObjectShortName">c_seed[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/c_poly">
-      <obj_property name="ElementShortName">c_poly[7:0]</obj_property>
-      <obj_property name="ObjectShortName">c_poly[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="group" fp_name="group4714">
-      <obj_property name="label">lfsr_inst</obj_property>
+   <wvobject type="group" fp_name="group8093">
+      <obj_property name="label">vhdl_practice</obj_property>
       <obj_property name="DisplayName">label</obj_property>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/a">
+         <obj_property name="ElementShortName">a[15:0]</obj_property>
+         <obj_property name="ObjectShortName">a[15:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/b">
+         <obj_property name="ElementShortName">b[15:0]</obj_property>
+         <obj_property name="ObjectShortName">b[15:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/sum">
+         <obj_property name="ElementShortName">sum[17:0]</obj_property>
+         <obj_property name="ObjectShortName">sum[17:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/prod">
+         <obj_property name="ElementShortName">prod[31:0]</obj_property>
+         <obj_property name="ObjectShortName">prod[31:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/prod_1">
+         <obj_property name="ElementShortName">prod_1[31:0]</obj_property>
+         <obj_property name="ObjectShortName">prod_1[31:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/prod_q1_15">
+         <obj_property name="ElementShortName">prod_q1_15[15:0]</obj_property>
+         <obj_property name="ObjectShortName">prod_q1_15[15:0]</obj_property>
+         <obj_property name="Radix">HEXRADIX</obj_property>
+         <obj_property name="Reversed">false</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/clk_period">
+         <obj_property name="ElementShortName">clk_period</obj_property>
+         <obj_property name="ObjectShortName">clk_period</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/sim_time">
+         <obj_property name="ElementShortName">sim_time</obj_property>
+         <obj_property name="ObjectShortName">sim_time</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/pseudo_rand">
+         <obj_property name="ElementShortName">pseudo_rand</obj_property>
+         <obj_property name="ObjectShortName">pseudo_rand</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/c_lfsr_msb">
+         <obj_property name="ElementShortName">c_lfsr_msb</obj_property>
+         <obj_property name="ObjectShortName">c_lfsr_msb</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/c_seed">
+         <obj_property name="ElementShortName">c_seed[7:0]</obj_property>
+         <obj_property name="ObjectShortName">c_seed[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/c_poly">
+         <obj_property name="ElementShortName">c_poly[7:0]</obj_property>
+         <obj_property name="ObjectShortName">c_poly[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="group" fp_name="group4714">
+         <obj_property name="label">lfsr_inst</obj_property>
+         <obj_property name="DisplayName">label</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/data_valid">
+         <obj_property name="ElementShortName">data_valid</obj_property>
+         <obj_property name="ObjectShortName">data_valid</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/chip_count">
+         <obj_property name="ElementShortName">chip_count</obj_property>
+         <obj_property name="ObjectShortName">chip_count</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfsr_en">
+         <obj_property name="ElementShortName">lfsr_en</obj_property>
+         <obj_property name="ObjectShortName">lfsr_en</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/chipped_byte">
+         <obj_property name="ElementShortName">chipped_byte[7:0]</obj_property>
+         <obj_property name="ObjectShortName">chipped_byte[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/chipped_buffer">
+         <obj_property name="ElementShortName">chipped_buffer[7:0]</obj_property>
+         <obj_property name="ObjectShortName">chipped_buffer[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/rx_chip_count">
+         <obj_property name="ElementShortName">rx_chip_count</obj_property>
+         <obj_property name="ObjectShortName">rx_chip_count</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/corr_accum">
+         <obj_property name="ElementShortName">corr_accum[4:0]</obj_property>
+         <obj_property name="ObjectShortName">corr_accum[4:0]</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/rx_data_valid">
+         <obj_property name="ElementShortName">rx_data_valid</obj_property>
+         <obj_property name="ObjectShortName">rx_data_valid</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/rx_data_bit">
+         <obj_property name="ElementShortName">rx_data_bit</obj_property>
+         <obj_property name="ObjectShortName">rx_data_bit</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/rx_data_symbol">
+         <obj_property name="ElementShortName">rx_data_symbol[7:0]</obj_property>
+         <obj_property name="ObjectShortName">rx_data_symbol[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/tx_data_symbol">
+         <obj_property name="ElementShortName">tx_data_symbol[7:0]</obj_property>
+         <obj_property name="ObjectShortName">tx_data_symbol[7:0]</obj_property>
+      </wvobject>
    </wvobject>
-   <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/data_valid">
-      <obj_property name="ElementShortName">data_valid</obj_property>
-      <obj_property name="ObjectShortName">data_valid</obj_property>
+   <wvobject type="group" fp_name="group6114">
+      <obj_property name="label">lfm</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <obj_property name="isExpanded"></obj_property>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/clk">
+         <obj_property name="ElementShortName">clk</obj_property>
+         <obj_property name="ObjectShortName">clk</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/arst">
+         <obj_property name="ElementShortName">arst</obj_property>
+         <obj_property name="ObjectShortName">arst</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/data_valid">
+         <obj_property name="ElementShortName">data_valid</obj_property>
+         <obj_property name="ObjectShortName">data_valid</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/taps_valid">
+         <obj_property name="ElementShortName">taps_valid</obj_property>
+         <obj_property name="ObjectShortName">taps_valid</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/taps">
+         <obj_property name="ElementShortName">taps[15:0]</obj_property>
+         <obj_property name="ObjectShortName">taps[15:0]</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/bit_in">
+         <obj_property name="ElementShortName">bit_in</obj_property>
+         <obj_property name="ObjectShortName">bit_in</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/corr_valid">
+         <obj_property name="ElementShortName">corr_valid</obj_property>
+         <obj_property name="ObjectShortName">corr_valid</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/G_MSB">
+         <obj_property name="ElementShortName">G_MSB</obj_property>
+         <obj_property name="ObjectShortName">G_MSB</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/G_LEN">
+         <obj_property name="ElementShortName">G_LEN</obj_property>
+         <obj_property name="ObjectShortName">G_LEN</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/clk">
+         <obj_property name="ElementShortName">clk</obj_property>
+         <obj_property name="ObjectShortName">clk</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/arst">
+         <obj_property name="ElementShortName">arst</obj_property>
+         <obj_property name="ObjectShortName">arst</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_sig_en">
+         <obj_property name="ElementShortName">lfm_sig_en</obj_property>
+         <obj_property name="ObjectShortName">lfm_sig_en</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/mf_taps_valid">
+         <obj_property name="ElementShortName">mf_taps_valid</obj_property>
+         <obj_property name="ObjectShortName">mf_taps_valid</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/mf_taps">
+         <obj_property name="ElementShortName">mf_taps[15:0]</obj_property>
+         <obj_property name="ObjectShortName">mf_taps[15:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/debug_out">
+         <obj_property name="ElementShortName">debug_out[15:0]</obj_property>
+         <obj_property name="ObjectShortName">debug_out[15:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_inst/corr_out">
+         <obj_property name="ElementShortName">corr_out[16:0]</obj_property>
+         <obj_property name="ObjectShortName">corr_out[16:0]</obj_property>
+         <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+         <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
+         <obj_property name="AnalogYRangeType">ANALOG_YRANGETYPE_FIXED</obj_property>
+         <obj_property name="AnalogYRangeMin">-34.1277</obj_property>
+         <obj_property name="AnalogYRRangeMax">18.8723</obj_property>
+         <obj_property name="CellHeight">100</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_signal_valid">
+         <obj_property name="ElementShortName">lfm_signal_valid</obj_property>
+         <obj_property name="ObjectShortName">lfm_signal_valid</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_signal_out">
+         <obj_property name="ElementShortName">lfm_signal_out</obj_property>
+         <obj_property name="ObjectShortName">lfm_signal_out</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_signal">
+         <obj_property name="ElementShortName">lfm_signal</obj_property>
+         <obj_property name="ObjectShortName">lfm_signal</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/signal_state">
+         <obj_property name="ElementShortName">signal_state</obj_property>
+         <obj_property name="ObjectShortName">signal_state</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_counter">
+         <obj_property name="ElementShortName">chirp_counter</obj_property>
+         <obj_property name="ObjectShortName">chirp_counter</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_pn">
+         <obj_property name="ElementShortName">chirp_pn</obj_property>
+         <obj_property name="ObjectShortName">chirp_pn</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_en">
+         <obj_property name="ElementShortName">chirp_en</obj_property>
+         <obj_property name="ObjectShortName">chirp_en</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/rand_counter">
+         <obj_property name="ElementShortName">rand_counter</obj_property>
+         <obj_property name="ObjectShortName">rand_counter</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_en">
+         <obj_property name="ElementShortName">lfm_en</obj_property>
+         <obj_property name="ObjectShortName">lfm_en</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/G_CHIRP_MSB">
+         <obj_property name="ElementShortName">G_CHIRP_MSB</obj_property>
+         <obj_property name="ObjectShortName">G_CHIRP_MSB</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/G_LEN">
+         <obj_property name="ElementShortName">G_LEN</obj_property>
+         <obj_property name="ObjectShortName">G_LEN</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_chirp_poly">
+         <obj_property name="ElementShortName">c_chirp_poly[3:0]</obj_property>
+         <obj_property name="ObjectShortName">c_chirp_poly[3:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_chirp_seed">
+         <obj_property name="ElementShortName">c_chirp_seed[3:0]</obj_property>
+         <obj_property name="ObjectShortName">c_chirp_seed[3:0]</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_chirp_len">
+         <obj_property name="ElementShortName">c_chirp_len</obj_property>
+         <obj_property name="ObjectShortName">c_chirp_len</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_rand_interval">
+         <obj_property name="ElementShortName">c_rand_interval</obj_property>
+         <obj_property name="ObjectShortName">c_rand_interval</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_lfsr_msb">
+         <obj_property name="ElementShortName">c_lfsr_msb</obj_property>
+         <obj_property name="ObjectShortName">c_lfsr_msb</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_seed">
+         <obj_property name="ElementShortName">c_seed[7:0]</obj_property>
+         <obj_property name="ObjectShortName">c_seed[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/c_poly">
+         <obj_property name="ElementShortName">c_poly[7:0]</obj_property>
+         <obj_property name="ObjectShortName">c_poly[7:0]</obj_property>
+      </wvobject>
    </wvobject>
-   <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/chip_count">
-      <obj_property name="ElementShortName">chip_count</obj_property>
-      <obj_property name="ObjectShortName">chip_count</obj_property>
+   <wvobject type="group" fp_name="group8081">
+      <obj_property name="label">chirp_lfsr</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/clk">
+         <obj_property name="ElementShortName">clk</obj_property>
+         <obj_property name="ObjectShortName">clk</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/arst">
+         <obj_property name="ElementShortName">arst</obj_property>
+         <obj_property name="ObjectShortName">arst</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/pn_out">
+         <obj_property name="ElementShortName">pn_out</obj_property>
+         <obj_property name="ObjectShortName">pn_out</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/enable">
+         <obj_property name="ElementShortName">enable</obj_property>
+         <obj_property name="ObjectShortName">enable</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/lfsr_reg">
+         <obj_property name="ElementShortName">lfsr_reg[3:0]</obj_property>
+         <obj_property name="ObjectShortName">lfsr_reg[3:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/taps">
+         <obj_property name="ElementShortName">taps[3:0]</obj_property>
+         <obj_property name="ObjectShortName">taps[3:0]</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/feedback">
+         <obj_property name="ElementShortName">feedback</obj_property>
+         <obj_property name="ObjectShortName">feedback</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/G_MSB">
+         <obj_property name="ElementShortName">G_MSB</obj_property>
+         <obj_property name="ObjectShortName">G_MSB</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/G_SEED">
+         <obj_property name="ElementShortName">G_SEED[3:0]</obj_property>
+         <obj_property name="ObjectShortName">G_SEED[3:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/chirp_lfsr/G_POLY">
+         <obj_property name="ElementShortName">G_POLY[3:0]</obj_property>
+         <obj_property name="ObjectShortName">G_POLY[3:0]</obj_property>
+      </wvobject>
    </wvobject>
-   <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfsr_en">
-      <obj_property name="ElementShortName">lfsr_en</obj_property>
-      <obj_property name="ObjectShortName">lfsr_en</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/chipped_byte">
-      <obj_property name="ElementShortName">chipped_byte[7:0]</obj_property>
-      <obj_property name="ObjectShortName">chipped_byte[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/chipped_buffer">
-      <obj_property name="ElementShortName">chipped_buffer[7:0]</obj_property>
-      <obj_property name="ObjectShortName">chipped_buffer[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/rx_chip_count">
-      <obj_property name="ElementShortName">rx_chip_count</obj_property>
-      <obj_property name="ObjectShortName">rx_chip_count</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/corr_accum">
-      <obj_property name="ElementShortName">corr_accum[4:0]</obj_property>
-      <obj_property name="ObjectShortName">corr_accum[4:0]</obj_property>
-      <obj_property name="Radix">SIGNEDDECRADIX</obj_property>
-      <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
-      <obj_property name="CellHeight">100</obj_property>
-   </wvobject>
-   <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/rx_data_valid">
-      <obj_property name="ElementShortName">rx_data_valid</obj_property>
-      <obj_property name="ObjectShortName">rx_data_valid</obj_property>
-   </wvobject>
-   <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/rx_data_bit">
-      <obj_property name="ElementShortName">rx_data_bit</obj_property>
-      <obj_property name="ObjectShortName">rx_data_bit</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/rx_data_symbol">
-      <obj_property name="ElementShortName">rx_data_symbol[7:0]</obj_property>
-      <obj_property name="ObjectShortName">rx_data_symbol[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/tx_data_symbol">
-      <obj_property name="ElementShortName">tx_data_symbol[7:0]</obj_property>
-      <obj_property name="ObjectShortName">tx_data_symbol[7:0]</obj_property>
+   <wvobject type="group" fp_name="group8092">
+      <obj_property name="label">lfm_lfsr</obj_property>
+      <obj_property name="DisplayName">label</obj_property>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/clk">
+         <obj_property name="ElementShortName">clk</obj_property>
+         <obj_property name="ObjectShortName">clk</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/arst">
+         <obj_property name="ElementShortName">arst</obj_property>
+         <obj_property name="ObjectShortName">arst</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/pn_out">
+         <obj_property name="ElementShortName">pn_out</obj_property>
+         <obj_property name="ObjectShortName">pn_out</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/enable">
+         <obj_property name="ElementShortName">enable</obj_property>
+         <obj_property name="ObjectShortName">enable</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/lfsr_reg">
+         <obj_property name="ElementShortName">lfsr_reg[7:0]</obj_property>
+         <obj_property name="ObjectShortName">lfsr_reg[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/taps">
+         <obj_property name="ElementShortName">taps[7:0]</obj_property>
+         <obj_property name="ObjectShortName">taps[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="logic" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/feedback">
+         <obj_property name="ElementShortName">feedback</obj_property>
+         <obj_property name="ObjectShortName">feedback</obj_property>
+      </wvobject>
+      <wvobject type="other" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/G_MSB">
+         <obj_property name="ElementShortName">G_MSB</obj_property>
+         <obj_property name="ObjectShortName">G_MSB</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/G_SEED">
+         <obj_property name="ElementShortName">G_SEED[7:0]</obj_property>
+         <obj_property name="ObjectShortName">G_SEED[7:0]</obj_property>
+      </wvobject>
+      <wvobject type="array" fp_name="/tb_vhdl_practice/tb_inst/lfm_sig_gen/lfm_lfsr/G_POLY">
+         <obj_property name="ElementShortName">G_POLY[7:0]</obj_property>
+         <obj_property name="ObjectShortName">G_POLY[7:0]</obj_property>
+      </wvobject>
    </wvobject>
 </wave_config>

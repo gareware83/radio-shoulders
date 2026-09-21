@@ -2,19 +2,21 @@ library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.numeric_std.all;
 library work;
-use work.all;
+use work.vhdl_practice_pkg.all;
 
 entity lfsr is 
     Generic (
     --default generics
         G_MSB  : integer := 7;
-        G_SEED : std_logic_vector(G_MSB downto 0) := x"FF";
-        G_POLY : std_logic_vector(G_MSB downto 0) := x"AA"-- polynomial bit i set, lfsr_reg(i) is a tap
+        G_SEED : std_logic_vector(G_MSB downto 0) := lfsr_seed(G_MSB + 1);
+        G_POLY : std_logic_vector(G_MSB downto 0) := lfsr_poly(G_MSB + 1)-- polynomial bit i set, lfsr_reg(i) is a tap
+        
     );
     Port (
         clk      : in std_logic;
         arst     : in std_logic;
         pn_out   : out std_logic;
+        reload   : in std_logic;
         enable   : in std_logic
     );
 end lfsr;
@@ -37,7 +39,11 @@ begin
         if arst = '1' then
             lfsr_reg <= G_SEED;
         elsif rising_edge(clk) and enable = '1' then
-            lfsr_reg <= feedback & lfsr_reg(G_MSB downto 1);
+            if reload = '1' then 
+                lfsr_reg <= G_SEED;
+            elsif enable = '1' then
+                lfsr_reg <= feedback & lfsr_reg(G_MSB downto 1);
+            end if;
         end if;
     end process;
     
