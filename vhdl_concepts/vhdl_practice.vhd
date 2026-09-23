@@ -22,7 +22,7 @@ architecture Behavioral of vhdl_practice is
     constant c_poly     : std_logic_vector(c_lfsr_msb downto 0) := x"AA";
     constant c_chips_per_bit : integer := 8;
     constant c_chirp_msb : integer := 3;
-    constant c_chirp_len : integer := 2**lfsr_size(c_chirp_msb + 1);
+    constant c_chirp_len : integer := 2**(c_chirp_msb + 1) - 1;
     
   
     
