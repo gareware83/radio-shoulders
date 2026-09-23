@@ -36,33 +36,12 @@ end entity;
 architecture rtl of pll_2nd_order is
 -- Loop gains, Q(C_GAIN_FRAC) fixed point: effective gain = K / 2**C_GAIN_FRAC.
 -- Raising C_GAIN_FRAC slows the loop and increases headroom; lowering it
--- speeds acquisition and risks instability. Tune this rather than letting the
--- arithmetic overflow.
+-- speeds acquisition and risks instability. Tuning can be done here
 --
--- Designed by test_bench/loop_model.py (Bn*Ts=0.001, zeta=0.707) from the
--- FIXED detector's measured Kd - not the untuned placeholders these replace.
--- loopf_proc's structure (u accumulates K1*e[n]+K2*e[n-1] directly, no
--- separate integral accumulator) is NOT the textbook Kp/Ki topology; see
--- pll_kp_ki_to_rtl()'s docstring for the K1=Kp+Ki, K2=-Kp mapping used to
--- get here. Regenerate with loop_model.py rather than hand-tuning either
--- value on its own - they only make sense as this specific pair.
+-- Designed by test_bench/loop_model.py (Bn*Ts=0.001, zeta=0.707)
+-- loopf_proc's structure u accumulates K1*e[n]+K2*e[n-1] directly, no
+-- separate integral accumulator. Regenerate loop filte coeffs with loop_model.py
 --
--- SIGN: this pd_proc rotates the input FORWARD by theta_nco
--- (psi = phi_in + theta_nco), not the standard DEROTATION
--- (psi = phi_in - theta_nco) closed-form PLL design formulas assume - see
--- pll_phase_detector()'s and characterize_pll_detector()'s docstrings in
--- loop_model.py. Missing that sign once already shipped a K1/K2 pair that
--- passed every dead-zone/margin check yet was pure POSITIVE feedback in the
--- real closed loop - confirmed by run_pll_pure_tone(), a single-tone
--- closed-loop test with no data modulation at all: phase_err oscillated
--- continuously across virtually the full detector range (RMS ~6.5e8)
--- regardless of loop bandwidth, damping factor, or step-size clamping,
--- because none of those fix a sign error. Negating BOTH K1 and K2 (this
--- pair) collapsed that to phase_err RMS ~58k - an ~11,000x reduction - with
--- u landing within 0.01% of the correct value. loop_model.py's
--- characterize_pll_detector() now negates its measured Kd before this
--- design is derived, so a straight regenerate keeps the right sign
--- automatically - this comment is here so it's obvious if it ever isn't.
 
 constant C_GAIN_FRAC : natural := 16;
 constant K1 : signed(15 downto 0) := to_signed(-810,16);
@@ -90,7 +69,7 @@ end function;
 ------------------------------------------------------------------
 -- NCO: phase accumulator
 ------------------------------------------------------------------
--- 32-bit accumulator spans one full circle. The upper bits ARE the phase
+-- 32-bit accumulator spans one full circle. The upper bits are the phase
 -- index - no counting or rollover detection needed:
 --   [31:30] quadrant
 --   [29:22] 8-bit index into the 256-entry quarter-wave LUT
@@ -102,7 +81,7 @@ signal phase_lookup     : std_logic_vector(7 downto 0) := (others => '0');
 signal nco_cos, nco_sin : signed(15 downto 0)          := (others => '0');
 signal cos_raw, sin_raw : std_logic_vector(15 downto 0) := (others => '0');
 
--- quadrant delayed to match the ROMs' READ_LATENCY_A, so the sign folding is
+-- quadrant delayed to match the ROMs' READ_LATENCY_A, so the sign folding for quarter wave LUT is
 -- applied to the sample it actually belongs to
 signal quadrant_d       : unsigned(1 downto 0)         := (others => '0');
 ------------------------------------------------------------------
@@ -124,7 +103,7 @@ signal u              : signed(31 downto 0) := (others => '0');
 -- should track and hold steady once phase_err has settled.
 --
 -- u also gets dont_touch, not just mark_debug: it's a 32-bit accumulator
--- that (per this file's own comments) rarely gets near its saturation
+-- that rarely gets near its saturation
 -- rails for real input - synthesis's static range analysis can legitimately
 -- prove individual high-order bits never change for the reachable values it
 -- sees and constant-propagate just those bits away, even though mark_debug
@@ -146,16 +125,15 @@ begin
 ------------------------------------------------------------------
 -- Only the accumulator is sequential. Everything downstream is a
 -- combinational slice of it, so the LUT index can't drift out of step with
--- the true phase - which a separately-counted index inevitably does, since
--- nothing ever re-syncs the two after a missed or spurious increment.
+-- phase 
 nco_proc: process(clk)
 begin
     if rst = '1' then
         phase_acc  <= (others => '0');
         quadrant_d <= (others => '0');
     elsif rising_edge(clk) and data_valid = '1' then
-        -- u is the frequency word; unsigned cast gives the two's-complement
-        -- wraparound a phase accumulator wants
+        -- u is the frequency word; unsigned cast gives two's-complement
+        -- wraparound to the phase accumulator 
         phase_acc <= phase_acc + unsigned(u);
         -- align the quadrant with the ROM data it will sign-correct
         quadrant_d <= quadrant;
@@ -185,7 +163,7 @@ nco_sin <= -signed(sin_raw) when (quadrant_d = "10" or quadrant_d = "11")
 cos_lut : xpm_memory_sprom
 generic map (
     ADDR_WIDTH_A      => 8,
-    MEMORY_SIZE       => 256*16,     -- BITS, not words - easy trip-up
+    MEMORY_SIZE       => 256*16,     -- BITS, not words
     READ_DATA_WIDTH_A => 16,
     READ_LATENCY_A    => 1,
     MEMORY_INIT_FILE  => "cos.mem",
@@ -208,7 +186,7 @@ port map (
 sin_lut : xpm_memory_sprom
 generic map (
     ADDR_WIDTH_A      => 8,
-    MEMORY_SIZE       => 256*16,     -- BITS, not words - easy trip-up
+    MEMORY_SIZE       => 256*16,     -- BITS, not words
     READ_DATA_WIDTH_A => 16,
     READ_LATENCY_A    => 1,
     MEMORY_INIT_FILE  => "sine.mem",
@@ -241,21 +219,8 @@ port map (
     -- Phase detector: rotate input by the NCO estimate, then a
     -- decision-directed cross product on the ROTATED sample.
     ------------------------------------------------------------------
--- The previous version crossed the RAW, un-rotated I_in/Q_in against the
--- rotated pair: phase_err <= I_in*Q_rot - Q_in*I_rot. Algebraically, with
--- I_rot/Q_rot themselves defined as I_in/Q_in rotated by theta (the NCO's
--- own phase), that cross product collapses to exactly
--- (I_in^2 + Q_in^2) * sin(theta) - a term that depends on the NCO's OWN
--- phase and the input's magnitude, but never on the input's actual phase.
--- It could not detect a phase error at all, confirmed numerically in
--- test_bench/loop_model.py (characterize_pll_detector(): sweeping the
--- input's phase at fixed NCO phase gave zero response; sweeping the NCO's
--- phase alone reproduced a full sin curve - the two sweeps should have
--- looked similar for a genuine phase detector, and instead only one of them
--- did anything).
 --
--- Fixed to the decision-directed form the old code's own comment named but
--- didn't implement: e = sign(I_rot)*Q_rot - sign(Q_rot)*I_rot. For a
+-- Fixed to the decision-directed form: e = sign(I_rot)*Q_rot - sign(Q_rot)*I_rot. For a
 -- correctly-decided QPSK symbol this is proportional to sin(residual phase
 -- error) and invariant to which of the four constellation points is
 -- currently transmitted - the hard decision (which quadrant) supplies the
