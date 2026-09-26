@@ -220,7 +220,8 @@ port map (
     -- decision-directed cross product on the ROTATED sample.
     ------------------------------------------------------------------
 --
--- Fixed to the decision-directed form: e = sign(I_rot)*Q_rot - sign(Q_rot)*I_rot. For a
+-- Fixed to the decision-directed form: e = sign(I_rot)*Q_rot - sign(Q_rot)*I_rot, computationally much cheaper than
+-- e(n) = I(n)·Q(n)·(I(n)² − Q(n)²). For a
 -- correctly-decided QPSK symbol this is proportional to sin(residual phase
 -- error) and invariant to which of the four constellation points is
 -- currently transmitted - the hard decision (which quadrant) supplies the
