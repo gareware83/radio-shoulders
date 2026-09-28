@@ -63,6 +63,9 @@ architecture Behavioral of vhdl_practice is
     signal lfm_corr_out   : signed(c_chirp_len downto 0);  -- lfm's corr_out is signed(G_LEN downto 0), G_LEN=16 below
     signal corr_valid     : std_logic := '0';
     
+    signal fir_valid : std_logic := '0';
+    signal fir_ma_data : signed(7 downto 0):= (others => '0');
+    
 begin
     
 
@@ -252,6 +255,20 @@ lfm_sig_gen : entity work.lfm_signal_gen
         ,lfm_signal_valid => lfm_data_valid
         ,lfm_signal_out   => lfm_bit_in
     );
+    
+fir_ma_proc : entity work.fir_ma_filter
+    generic map (
+        SAMP_WIDTH => 8
+    )
+    port map (
+         clk      => clk
+        ,rst      => arst 
+        ,enable   => data_valid--just key off an available enable for now
+        ,valid    => fir_valid -- pinned to 1 for now, probably going to need a state machine or generate to handle the usm/avg stages correctly
+        ,in_data  => signed(chipped_byte)
+        ,out_data => fir_ma_data
+    );
+    
 sim_t : process
 begin
     wait for sim_time;
