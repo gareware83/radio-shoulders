@@ -5,6 +5,7 @@ Library xpm;
 use xpm.vcomponents.all;
 library work;
 use work.vhdl_practice_pkg.all;
+use STD.TEXTIO.ALL;
 
 entity vhdl_practice is
 
@@ -66,6 +67,13 @@ architecture Behavioral of vhdl_practice is
     signal fir_valid : std_logic := '0';
     signal fir_ma_data : signed(7 downto 0):= (others => '0');
     
+     -- Stimulus file I/O
+    file stim_file  : text open read_mode is "ddc_input.dat";
+    signal mf_data  : signed(15 downto 0) := (others => '0');
+    signal mf_valid : std_logic := '0';
+    signal mf_valid_out : std_logic;
+    signal mf_data_out  : signed(15 downto 0) := (others => '0'); 
+    
 begin
     
 
@@ -98,6 +106,32 @@ begin
     arst <= '0';
     wait;
 end process;
+
+-- Stimulus for match filter fun
+    --------------------------------------------------------------------------
+    stim_process : process
+        variable linebuf : line;
+        variable int_val : integer := 0;
+    begin
+        mf_data     <= (others => '0');
+        mf_valid <= '0';
+        wait until rst = '0';
+        wait until rising_edge(clk);
+
+        while not endfile(stim_file) loop
+            readline(stim_file, linebuf);
+            read(linebuf, int_val);
+
+            mf_data  <= to_signed(int_val, 16);
+            mf_valid <= '1';
+            wait until rising_edge(clk);
+        end loop;
+
+        mf_valid  <= '0';
+        mf_data   <= (others => '0');
+        
+        wait;
+    end process;
 
 --fixed point arithmetic with round and truncate
 qn_process : process(clk, arst)
@@ -237,7 +271,7 @@ lfm_inst : entity work.lfm
         ,taps_valid => lfm_taps_valid
         ,taps       => lfm_taps
         ,bit_in     => lfm_bit_in
-        ,corr_out  => lfm_corr_out
+        ,corr_out   => lfm_corr_out
         ,corr_valid => corr_valid
     );
     
@@ -269,6 +303,15 @@ fir_ma_proc : entity work.fir_ma_filter
         ,out_data => fir_ma_data
     );
     
+ mf_proc : entity work.matched_filter
+     port map (
+          clk       => clk
+         ,rst       => arst
+         ,enable    => mf_valid
+         ,valid     => mf_valid_out 
+         ,in_data   => mf_data
+         ,out_data  => mf_data_out 
+     );
 sim_t : process
 begin
     wait for sim_time;
