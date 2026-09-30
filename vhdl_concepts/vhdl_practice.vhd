@@ -8,6 +8,9 @@ use work.vhdl_practice_pkg.all;
 use STD.TEXTIO.ALL;
 
 entity vhdl_practice is
+    Generic(
+        STIM : string := "impulse"--"file"    
+    );
 
     Port(
         sim_passed : out std_logic;
@@ -16,6 +19,8 @@ entity vhdl_practice is
 end vhdl_practice;
 
 architecture Behavioral of vhdl_practice is
+
+    type t_mf_impulse is array (8 downto 0) of signed(15 downto 0);
     constant clk_period : time := 1 us; --1 MHz clock
     constant sim_time   : time := 8000 * clk_period; -- 8ms simulation time
     constant c_lfsr_msb : integer := 7;
@@ -24,7 +29,17 @@ architecture Behavioral of vhdl_practice is
     constant c_chips_per_bit : integer := 8;
     constant c_chirp_msb : integer := 3;
     constant c_chirp_len : integer := 2**(c_chirp_msb + 1) - 1;
-    
+    constant c_mf_impulse : t_mf_impulse := (
+                            to_signed(0,16),
+                            to_signed(0,16),
+                            to_signed(0,16),
+                            to_signed(0,16),
+                            to_signed(16384,16),
+                            to_signed(0,16),
+                            to_signed(0,16),
+                            to_signed(0,16),
+                            to_signed(0,16)
+                            );
   
     
     signal clk  : std_logic := '0';
@@ -73,7 +88,8 @@ architecture Behavioral of vhdl_practice is
     signal mf_valid : std_logic := '0';
     signal mf_valid_out : std_logic;
     signal mf_data_out  : signed(15 downto 0) := (others => '0'); 
-    
+    -- impulse response test signals
+    signal stim_index : integer range 0 to 8 := 0;
 begin
     
 
@@ -100,38 +116,64 @@ end process;
 
 arst_process : process
 begin
-    wait for 4 * clk_period;
+    wait for 5 * clk_period;
     arst <= '1';
-    wait for 4 * clk_period;
+    wait for 5 * clk_period;
     arst <= '0';
     wait;
 end process;
 
 -- Stimulus for match filter fun
     --------------------------------------------------------------------------
-    stim_process : process
-        variable linebuf : line;
-        variable int_val : integer := 0;
-    begin
-        mf_data     <= (others => '0');
-        mf_valid <= '0';
-        wait until rst = '0';
-        wait until rising_edge(clk);
-
-        while not endfile(stim_file) loop
-            readline(stim_file, linebuf);
-            read(linebuf, int_val);
-
-            mf_data  <= to_signed(int_val, 16);
-            mf_valid <= '1';
+    stim_select : if STIM = "file" generate
+        stim_process : process
+            variable linebuf : line;
+            variable int_val : integer := 0;
+        begin
+            mf_data     <= (others => '0');
+            mf_valid <= '0';
+            wait until arst = '0';
             wait until rising_edge(clk);
-        end loop;
 
-        mf_valid  <= '0';
-        mf_data   <= (others => '0');
+            while not endfile(stim_file) loop
+                readline(stim_file, linebuf);
+                read(linebuf, int_val);
+
+                mf_data  <= to_signed(int_val, 16);
+                mf_valid <= '1';
+                wait until rising_edge(clk);
+            end loop;
+
+            mf_valid  <= '0';
+            mf_data   <= (others => '0');
+            
+            wait;
+        end process;
+    elsif STIM = "impulse" generate
+        stim_proc : process(clk, arst)
+        begin
+            if rising_edge(clk) then
+                if arst = '1' then
+                    stim_index <= 0;
+                    mf_valid     <= '0';
+                    mf_data    <= (others => '0');
+                else
+                    mf_valid <= '1';  -- held high for the whole run
         
-        wait;
-    end process;
+                    if stim_index <= 8 then
+                        mf_data <= c_mf_impulse(stim_index);
+                    else
+                        mf_data <= (others => '0');  -- zero-pad past the array so the tail of the response has room to appear
+                    end if;
+        
+                    if stim_index < 8 then
+                        stim_index <= stim_index + 1;
+                    end if;
+                end if;
+            end if;
+end process stim_proc;
+       
+    end generate;
 
 --fixed point arithmetic with round and truncate
 qn_process : process(clk, arst)

@@ -40,59 +40,64 @@ architecture Behavioral of matched_filter is
     --buffer in N_TAPS samples for match filter multiply accumulate, sized N_TAPS + 1 to register the raw incoming sample
     type t_sample_array is array(0 to N_TAPS ) of signed(SAMP_WIDTH - 1 downto 0);
     type t_sum_array is array(0 to N_TAPS ) of signed(c_accum_width - 1 downto 0);
+    type t_mult_array is array(0 to N_TAPS ) of signed(c_mult_width - 1 downto 0);
     
-    signal sample_buffer  : t_sample_array := (others => (others => '0'));
-    signal sum_buffer     : t_sum_array    := (others => (others => '0'));
-    signal valid_buffer   : std_logic_vector(0 to N_TAPS);
-    signal round          : t_sum_array  := (others => (others => '0'));
+    signal sample_reg  : t_sample_array := (others => (others => '0'));
+    signal mult_reg    : t_mult_array   := (others => (others => '0'));
+    signal accumulator : signed(c_accum_width - 1 downto 0) := (others => '0');
+    signal valid_pipe  : std_logic_vector(2 downto 0) := (others => '0'); --as many stages as needed for the filter pipe
+    signal round       : signed(c_accum_width - 1 downto 0) := (others => '0');
 begin
-    
-    --initialize with 0th sample for sample array
-   ind0_proc : process(clk, rst)
-   begin
-       if rising_edge(clk) then
-           if rst = '1' then
-               sample_buffer(0) <= (others => '0');
-               sum_buffer(0)    <= (others => '0');
-               valid_buffer(0)  <= '0';
-               round (0)        <= (others => '0');
-           else 
-               sample_buffer(0) <= in_data;
-               valid_buffer(0)  <= enable;
-           end if;
-       end if;
-   end process ind0_proc;
    
-    out_data <= round(N_TAPS )(30 downto 15);--truncate 
-    valid    <= valid_buffer(N_TAPS) and enable;
-    mf_gen: for i in 0 to N_TAPS - 1 generate
-        mf_proc : process(clk, rst, enable)
-            -- coeffs and samples are signed Q1.15, so fixed point multply bit expansion is
-            -- is Q2.30, accumulate is then Q3.30, with summed bit expansion 
-            variable mult  : signed (c_mult_width - 1 downto 0);
-            --variable acc   : signed (c_accum_width - 1  downto 0);--MSB expansion for sum of acc and mult
-            --variable round : signed (c_accum_width - 1 downto 0);
-        begin
-            if rising_edge(clk) then
-                if rst = '1' then
-                    sample_buffer(i + 1) <= (others => '0');--don't double drive index 0 after initializing with incoming sample
-                    sum_buffer(i + 1)    <= (others => '0');
-                    round (i + 1)        <= (others => '0');
-                    valid_buffer(i + 1)  <= '0';
-                elsif enable = '1' then
-                    valid_buffer(i + 1) <= valid_buffer(i);
-                    sample_buffer(i + 1) <= sample_buffer(i);
-                    --mult_buffer(i + 1)   <= resize((sample_buffer(i) * c_rrc_coeffs(i)), c_mult_width);
-                    --multiply in variable to ensure correct index is used in i + 1 sum
-                    mult := resize((sample_buffer(i) * c_rrc_coeffs(i)), c_mult_width);
-                    sum_buffer(i + 1)    <= sum_buffer(i) + resize(mult, c_accum_width);
-                    --mult  := resize((sample_buffer(i) * c_rrc_coeffs(i)), c_mult_width);
-                    --acc   := resize(acc, c_accum_width) + resize(mult, c_accum_width);
-                    --round := resize(acc, c_accum_width) + to_signed(2**14, c_accum_width); -- rounding
-                    round(i + 1) <= resize(sum_buffer(i + 1), c_accum_width) + to_signed(2**14, c_accum_width); -- rounding
+    mf_proc : process(clk, rst, enable)
+        -- coeffs and samples are signed Q1.15, so fixed point multply bit expansion is
+        -- is Q2.30, accumulate is then Q3.30, with summed bit expansion 
+        variable accum  : signed (c_accum_width - 1 downto 0);
+        --variable acc   : signed (c_accum_width - 1  downto 0);--MSB expansion for sum of acc and mult
+        --variable round : signed (c_accum_width - 1 downto 0);
+    begin
+        if rising_edge(clk) then
+            if rst = '1' then
+               sample_reg  <= (others => (others => '0'));
+               mult_reg    <= (others => (others => '0'));
+               accumulator <= (others => '0');
+               valid_pipe  <= (others => '0');
+               round       <= (others => '0');
+               valid       <= '0';
+               out_data    <= (others => '0');
+            else
+                --Stage 0 : march contole valid along side data it describes
+                valid_pipe <= valid_pipe(1 downto 0) & enable;
+                --stage 1 shift reg for delay line z^-1
+                --array concat idiom
+                --if enable = '1' then
+                --    sample_reg <= in_data & sample_reg(0 to N_TAPS - 1);
+                --end if;
+                --my preferred way
+                if enable = '1' then
+                    for i in N_TAPS downto 1 loop
+                       sample_reg(i) <= sample_reg(i - 1);
+                    end loop;
+                    sample_reg(0) <= in_data;
                 end if;
+                -- Stage 2 : multiply taps with time reveresed filter coeffs (are mine time reversed?)
+                for i in 0 to N_TAPS - 1loop
+                    mult_reg(i) <= sample_reg(i) * c_rrc_coeffs(i);
+                end loop;
+
+                -- Stage 3 : accumulate the products
+                accum := (others => '0');
+                for i in 0 to N_TAPS loop
+                    accum := accum + resize(mult_reg(i), accum'length);
+                end loop;
+                accumulator <= accum;
+                round <= accumulator + to_signed(2**14, c_accum_width);
+                out_data <= round(30 downto 15);--truncate 
+                valid    <= valid_pipe(3);
+
             end if;
-        end process mf_proc;
-    end generate;
+        end if;
+    end process mf_proc;
+    
    
 end Behavioral;
