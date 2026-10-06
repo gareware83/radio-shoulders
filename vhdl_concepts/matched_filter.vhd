@@ -3,7 +3,7 @@ use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.NUMERIC_STD.ALL;
 
 --y[n] = sum(x[k]*h[k-1])
--- Matched filter implementation
+-- Direct form Matched filter implementation
 entity matched_filter is
     Generic (
         SAMP_WIDTH : integer := 16;
@@ -49,7 +49,7 @@ architecture Behavioral of matched_filter is
     signal round       : signed(c_accum_width - 1 downto 0) := (others => '0');
 begin
    
-    mf_proc : process(clk, rst, enable)
+    mf_proc : process(clk)
         -- coeffs and samples are signed Q1.15, so fixed point multply bit expansion is
         -- is Q2.30, accumulate is then Q3.30, with summed bit expansion 
         variable accum  : signed (c_accum_width - 1 downto 0);

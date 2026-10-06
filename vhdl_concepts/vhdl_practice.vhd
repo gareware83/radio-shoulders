@@ -9,7 +9,7 @@ use STD.TEXTIO.ALL;
 
 entity vhdl_practice is
     Generic(
-        STIM : string := "impulse"--"file"    
+        STIM : string := "file"--"impulse"--    
     );
 
     Port(
@@ -21,6 +21,7 @@ end vhdl_practice;
 architecture Behavioral of vhdl_practice is
 
     type t_mf_impulse is array (8 downto 0) of signed(15 downto 0);
+    type t_pwm_dc is array (7 downto 0) of unsigned(7 downto 0);
     constant clk_period : time := 1 us; --1 MHz clock
     constant sim_time   : time := 8000 * clk_period; -- 8ms simulation time
     constant c_lfsr_msb : integer := 7;
@@ -29,6 +30,8 @@ architecture Behavioral of vhdl_practice is
     constant c_chips_per_bit : integer := 8;
     constant c_chirp_msb : integer := 3;
     constant c_chirp_len : integer := 2**(c_chirp_msb + 1) - 1;
+    constant c_pwm_n     : integer := 7;
+    constant c_pwm_dc_count : integer := 7;
     constant c_mf_impulse : t_mf_impulse := (
                             to_signed(0,16),
                             to_signed(0,16),
@@ -40,7 +43,16 @@ architecture Behavioral of vhdl_practice is
                             to_signed(0,16),
                             to_signed(0,16)
                             );
-  
+    constant c_duty_cycles : t_pwm_dc := (
+                             to_unsigned(13,  8),
+                             to_unsigned(21,  8),
+                             to_unsigned(36,  8),
+                             to_unsigned(57,  8),
+                             to_unsigned(36,  8),
+                             to_unsigned(21,  8),
+                             to_unsigned(36,  8),
+                             to_unsigned(13,  8)
+                             );--fibonacci-esque
     
     signal clk  : std_logic := '0';
     signal rst  : std_logic := '1';
@@ -90,6 +102,27 @@ architecture Behavioral of vhdl_practice is
     signal mf_data_out  : signed(15 downto 0) := (others => '0'); 
     -- impulse response test signals
     signal stim_index : integer range 0 to 8 := 0;
+    
+    --pwm sigs
+    signal pwm_dc_valid : std_logic := '0'; 
+    signal pwm_index    : std_logic_vector(7 downto 0) := (others => '0');
+    signal duty_cycle   : unsigned(7 downto 0) := (others => '0');
+    signal pwm_sig      : std_logic := '0';
+    signal pwm_valid    : std_logic := '0';
+    signal duty_counter : unsigned(7 downto 0) := (others => '0');
+        --I want a pwm with a variable duty cycle for configurable average power
+    function onehot_select(s : std_logic_vector(c_pwm_n downto 0)) return unsigned is
+        variable acc : unsigned(c_pwm_dc_count downto 0) := (others => '0');
+        variable i : integer := 0;
+     begin
+         for i in 0 to c_pwm_n loop
+             if s(i) = '1' then 
+                 acc := acc or c_duty_cycles(i);
+              end if;
+          end loop;
+          return acc;
+      end function;
+    
 begin
     
 
@@ -150,30 +183,85 @@ end process;
             wait;
         end process;
     elsif STIM = "impulse" generate
+        --stim_proc : process(clk, arst)
+        --begin
+        --    if rising_edge(clk) then
+        --        if arst = '1' then
+        --            stim_index <= 0;
+        --            mf_valid     <= '0';
+        --            mf_data    <= (others => '0');
+        --        else
+        --            mf_valid <= '1';  -- held high for the whole run
+        --
+        --            if stim_index <= 8 then
+        --                mf_data <= c_mf_impulse(stim_index);
+        --            else
+        --                mf_data <= (others => '0');  -- zero-pad past the array so the tail of the response has room to appear
+        --            end if;
+        --
+        --            if stim_index < 8 then
+        --                stim_index <= stim_index + 1;
+        --            end if;
+        --        end if;
+        --    end if;
+        --end process stim_proc;
+        
         stim_proc : process(clk, arst)
         begin
             if rising_edge(clk) then
                 if arst = '1' then
                     stim_index <= 0;
-                    mf_valid     <= '0';
+                    mf_valid   <= '0';
                     mf_data    <= (others => '0');
                 else
-                    mf_valid <= '1';  -- held high for the whole run
+                    mf_valid <= '1';  -- Held high for the whole run
         
+                    -- Read from the 9-element array (indices 0 to 8)
                     if stim_index <= 8 then
                         mf_data <= c_mf_impulse(stim_index);
                     else
-                        mf_data <= (others => '0');  -- zero-pad past the array so the tail of the response has room to appear
+                        mf_data <= (others => '0');  -- Now safely reached!
                     end if;
         
-                    if stim_index < 8 then
+                    -- Let the index count way past 8 to let the filter drain
+                    if stim_index < 40 then
                         stim_index <= stim_index + 1;
                     end if;
                 end if;
             end if;
-end process stim_proc;
+        end process stim_proc;
        
     end generate;
+    
+    -- fast counter: fixed carrier period T, defines PWM frequency
+    -- period_counter <= period_counter + 1 when period_counter /= T - 1 else (others => '0');
+    -- pwm_out <= '1' when period_counter < duty_cycle else '0';   -- real intra-period duty
+    -- 
+    -- -- slow counter: advances the envelope once per full period of T
+    -- if period_counter = T - 1 then
+    --     pwm_index <= pwm_index(6 downto 0) & pwm_index(7);  -- same rotate-select already implemented
+    -- end if;
+
+    
+    duty_cycle <= onehot_select(pwm_index);
+    duty_cycle_proc : process(clk, arst)
+    begin 
+        if rising_edge(clk) then
+            if arst = '1' then
+                pwm_index <= (0 => '1', others => '0'); -- ring or 'one-hot' counter to cycle through duty cyle vector
+                pwm_dc_valid <= '0';
+                duty_counter <= (others => '0');
+            else 
+                duty_counter <= duty_counter + 1;
+                pwm_dc_valid <= '1';
+                if duty_counter = duty_cycle then 
+                    pwm_index <= pwm_index(6 downto 0) & pwm_index(7);--N=7, N-2 and N -1 for indices to rotate instead of shift through
+                    pwm_dc_valid <= '0';
+                    duty_counter <= (others => '0');
+                end if;
+            end if;
+       end if;
+    end process;
 
 --fixed point arithmetic with round and truncate
 qn_process : process(clk, arst)
@@ -332,7 +420,7 @@ lfm_sig_gen : entity work.lfm_signal_gen
         ,lfm_signal_out   => lfm_bit_in
     );
     
-fir_ma_proc : entity work.fir_ma_filter
+fir_ma_inst : entity work.fir_ma_filter
     generic map (
         SAMP_WIDTH => 8
     )
@@ -345,7 +433,7 @@ fir_ma_proc : entity work.fir_ma_filter
         ,out_data => fir_ma_data
     );
     
- mf_proc : entity work.matched_filter
+ mf_sys_inst : entity work.systolic_transposed_mf
      port map (
           clk       => clk
          ,rst       => arst
@@ -354,6 +442,17 @@ fir_ma_proc : entity work.fir_ma_filter
          ,in_data   => mf_data
          ,out_data  => mf_data_out 
      );
+
+pwm_inst : entity work.pwm
+    port map (
+         clk        => clk
+        ,rst        => arst
+        ,valid_in   => pwm_dc_valid
+        ,duty_cycle => duty_cycle
+        ,pwm_out    => pwm_sig
+        ,valid_out  => pwm_valid
+        ,counter    => duty_counter
+    );
 sim_t : process
 begin
     wait for sim_time;
